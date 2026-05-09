@@ -52,7 +52,7 @@ const CONFIG = {
   RATE_LIMIT_MAX: IS_PROD ? 15 : 50,
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
-  EMBEDDING_MODEL: 'models/gemini-embedding-2-flash',
+  EMBEDDING_MODEL: 'models/gemini-2.0-flash-lite',
   MODEL_COOLDOWN_MS: 60 * 1000,
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
