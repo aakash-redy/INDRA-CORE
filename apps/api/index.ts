@@ -32,13 +32,20 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 8000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
+export const VALID_DOMAINS = [
+  'Chassis', 'Braking', 'Powertrain', 'Safety',
+  'Aerodynamics', 'Electrical', 'General',
+] as const;
+type ValidDomain = typeof VALID_DOMAINS[number];
+
 const CONFIG = {
-  MATCH_THRESHOLD: 0.5,
+  MATCH_THRESHOLD: 0.4,
   LEARNED_MATCH_THRESHOLD: 0.75,
   MATCH_COUNT: 5,
   LEARNED_MATCH_COUNT: 3,
   CACHE_TTL_MS: 60 * 60 * 1000,
   CACHE_SIMILARITY_THRESHOLD: 0.97,
+  CACHE_MAX_ENTRIES: 500,
   MAX_MESSAGE_LENGTH: 1000,
   MIN_MESSAGE_LENGTH: 2,
   RATE_LIMIT_WINDOW_MS: 60 * 1000,
@@ -47,6 +54,8 @@ const CONFIG = {
   BODY_SIZE_LIMIT: '10kb',
   EMBEDDING_MODEL: 'models/gemini-embedding-001',
   MODEL_COOLDOWN_MS: 60 * 1000,
+  GEMINI_TIMEOUT_MS: 25_000,
+  RERANK_CHUNK_PREVIEW: 250,
 } as const;
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
@@ -144,6 +153,7 @@ interface LearnedChunk {
 }
 
 interface ModelRecord {
+  id?: number;
   name?: string;
   category?: string;
   description?: string;
@@ -157,6 +167,13 @@ interface CadNodeMatch {
   rule_id: string;
   cad_node_name: string;
   relevance_score?: number;
+}
+
+// NEW v13: keyword map result shape
+interface CadKeywordMatch {
+  model_id: number;
+  highlight_meshes: string[];
+  context_meshes: string[];
 }
 
 type QueryIntent = 'dimension' | 'compliance' | 'definition' | 'procedure' | 'general';
@@ -192,6 +209,11 @@ function findCacheHit(embedding: number[], domain: string): Record<string, unkno
 }
 
 function writeCache(embedding: number[], domain: string, response: Record<string, unknown>): void {
+  if (semanticCache.size >= CONFIG.CACHE_MAX_ENTRIES) {
+    const oldestKey = semanticCache.keys().next().value;
+    if (oldestKey) semanticCache.delete(oldestKey);
+    logger.info(`Cache eviction: max entries (${CONFIG.CACHE_MAX_ENTRIES}) reached.`);
+  }
   const key = `${domain}:${crypto.randomUUID()}`;
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
 }
@@ -226,7 +248,7 @@ async function saveLog(data: Record<string, unknown>): Promise<void> {
   try {
     const { error } = await supabase.from('sora_logs').insert([data]);
     if (error) logger.error('saveLog DB error', error);
-  } catch (err) {
+  } catch (err: unknown) {
     logger.error('saveLog threw', err);
   }
 }
@@ -246,8 +268,15 @@ async function saveLearnedPair(
 }
 
 // ============================================================================
-// ── 6. CORE AI ENGINE — PER-MODEL ROTATION
+// ── 6. CORE AI ENGINE — TIMEOUT WRAPPER + PER-MODEL ROTATION
 // ============================================================================
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`TIMEOUT: ${label} exceeded ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
 
 async function generateWithRoster(
   prompt: string,
@@ -265,12 +294,21 @@ async function generateWithRoster(
           ...(requireJson ? { responseMimeType: 'application/json' } : {}),
         },
       });
-      const result = await model.generateContent(prompt);
+      const result = await withTimeout(
+        model.generateContent(prompt),
+        CONFIG.GEMINI_TIMEOUT_MS,
+        slot.label,
+      );
       const text = result.response.text();
       slot.successCount++;
       logger.info(`[ROSTER] ${slot.label} ✓ (successes: ${slot.successCount})`);
       return text;
     } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.startsWith('TIMEOUT:')) {
+        logger.warn(`[ROSTER] ${slot.label} timed out — skipping.`);
+        continue;
+      }
       if (isSkippableError(error)) {
         coolSlot(slot);
         continue;
@@ -313,17 +351,82 @@ async function embedText(text: string, taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_
   return result.embedding.values;
 }
 
-const embedQuery    = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
+const embedQuery = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
 
 async function expandAndAverageEmbedding(query: string): Promise<number[]> {
   return embedQuery(query);
 }
 
-function rerankChunks(_query: string, chunks: RuleChunk[]): RuleChunk[] {
-  return [...chunks]
-    .sort((a, b) => b.similarity - a.similarity)
-    .map(c => ({ ...c, rerank_score: c.similarity }));
+// ============================================================================
+// ── 8. RERANKER — real cross-encoder via rerankRoster (token-efficient)
+// ============================================================================
+
+async function rerankChunks(query: string, chunks: RuleChunk[]): Promise<RuleChunk[]> {
+  if (chunks.length <= 1) return chunks;
+
+  const chunkList = chunks
+    .map((c, i) =>
+      `[${i}] Rule ${c.rule_id}: ${c.content.slice(0, CONFIG.RERANK_CHUNK_PREVIEW)}`
+    )
+    .join('\n\n');
+
+  const prompt = `You are a relevance scoring engine for a motorsport regulation assistant.
+Score each chunk 0.0–1.0 based on how directly it answers the query.
+0.0 = unrelated, 1.0 = directly and completely answers the question.
+
+Query: "${query}"
+
+Chunks:
+${chunkList}
+
+Return ONLY a JSON array of ${chunks.length} floats, one score per chunk, in order.
+Example for 3 chunks: [0.95, 0.3, 0.87]
+No explanation. No markdown. Pure JSON array only.`;
+
+  try {
+    const raw = await generateWithRoster(prompt, rerankRoster, true, 0.1);
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const scores: number[] = JSON.parse(cleaned);
+
+    if (!Array.isArray(scores) || scores.length !== chunks.length) {
+      throw new Error(`Score array length mismatch: got ${scores.length}, expected ${chunks.length}`);
+    }
+
+    return chunks
+      .map((c, i) => ({ ...c, rerank_score: typeof scores[i] === 'number' ? scores[i] : c.similarity }))
+      .sort((a, b) => (b.rerank_score ?? 0) - (a.rerank_score ?? 0));
+  } catch (err) {
+    logger.warn('[RERANKER] Failed — falling back to cosine order.', { error: String(err) });
+    return chunks
+      .sort((a, b) => b.similarity - a.similarity)
+      .map(c => ({ ...c, rerank_score: c.similarity }));
+  }
 }
+
+// ============================================================================
+// ── 9. PROMPT INJECTION GUARD
+// ============================================================================
+
+const INJECTION_PATTERNS: RegExp[] = [
+  /ignore (all )?(previous|prior|above) instructions/i,
+  /you are now/i,
+  /new (system )?prompt/i,
+  /forget (everything|all)/i,
+  /act as (a |an )?(?!engineer|assistant|regulations|technical)/i,
+  /disregard (all |your )?(previous |prior )?instructions/i,
+  /override (your )?(instructions|rules|guidelines)/i,
+  /\[system\]/i,
+  /<\/?system>/i,
+  /prompt injection/i,
+];
+
+function detectInjection(text: string): boolean {
+  return INJECTION_PATTERNS.some(p => p.test(text));
+}
+
+// ============================================================================
+// ── 10. INTENT CLASSIFICATION & PROMPT BUILDING
+// ============================================================================
 
 function classifyIntent(query: string): QueryIntent {
   const q = query.toLowerCase();
@@ -335,17 +438,78 @@ function classifyIntent(query: string): QueryIntent {
 }
 
 function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string, domain: string): string {
-  const base = `You are an expert AI Technical Regulations Assistant. Answer based ONLY on the provided regulation context. Always cite exact Rule IDs inline, e.g. [T3.14]. Do not speculate beyond the provided context.`;
+  const persona = `You are INDRA — the Integrated Neural Design and Regulations Assistant for Hexawatts Racing. You are precise, authoritative, and direct. Your tone is that of a senior technical engineer: confident, no fluff, no filler. Always cite Rule IDs inline like [T3.14].`;
+
+  const formatRules = `
+RESPONSE FORMAT RULES (follow strictly):
+- Open with a single bold TL;DR sentence that directly answers the question. No preamble.
+- Use clean markdown: ## for section headers, **bold** for values/rule IDs, bullet points for lists.
+- Never say "Based on the provided context" or "According to the regulations" — just answer.
+- End with a ⚡ INDRA NOTE if there is a critical caveat or enforcement tip worth flagging.
+- Keep responses tight. No padding. Every sentence must carry information.`;
 
   const intentInstructions: Record<QueryIntent, string> = {
-    dimension: `${base}\nThe user asks about a MEASUREMENT. Your response MUST:\n1. State the exact value with units first.\n2. List all related dimensional constraints as bullet points.\n3. Note any conditional rules or exceptions.`,
-    compliance: `${base}\nThe user asks a COMPLIANCE question. Your response MUST:\n1. Start with a clear verdict: ✅ COMPLIANT / ❌ NON-COMPLIANT / ⚠️ CONDITIONAL.\n2. Cite the determining rule(s).\n3. List any specific conditions or exceptions.`,
-    definition: `${base}\nThe user wants a DEFINITION. Your response MUST:\n1. Give a concise 1–2 sentence definition.\n2. Explain its purpose or function.\n3. Cite the defining rule.`,
-    procedure: `${base}\nThe user asks about a PROCEDURE. Your response MUST:\n1. List steps in numbered order.\n2. Highlight mandatory inspection or verification points.\n3. Cite the relevant rule for each key step.`,
-    general: `${base}\nProvide a clear, structured answer. Use bullet points for multiple points. Cite rule IDs inline.`,
+    dimension: `${persona}
+${formatRules}
+
+INTENT: DIMENSION QUERY
+Structure your answer as:
+**[Value + Unit]** — state the exact spec immediately.
+## Constraints
+Bullet list of all related dimensional limits with rule IDs.
+## Exceptions / Conditionals
+Any conditional rules or edge cases.`,
+
+    compliance: `${persona}
+${formatRules}
+
+INTENT: COMPLIANCE CHECK
+Structure your answer as:
+## Verdict
+✅ COMPLIANT / ❌ NON-COMPLIANT / ⚠️ CONDITIONAL — one line, bold.
+## Determining Rules
+Cite exact rule IDs and what they require.
+## Conditions / Exceptions
+What would change the verdict.`,
+
+    definition: `${persona}
+${formatRules}
+
+INTENT: DEFINITION
+Structure your answer as:
+**[Term]**: One crisp sentence definition.
+## Purpose / Function
+Why this component or rule exists in context.
+## Rule Reference
+The defining rule ID and its exact scope.`,
+
+    procedure: `${persona}
+${formatRules}
+
+INTENT: PROCEDURE
+Structure your answer as:
+## Steps
+Numbered list. Each step cites the relevant rule ID inline.
+## Mandatory Checkpoints
+Inspection or verification points that must not be skipped.`,
+
+    general: `${persona}
+${formatRules}
+
+INTENT: GENERAL TECHNICAL QUERY
+Answer directly and structured. Use ## headers to separate distinct topics. Cite rule IDs inline throughout.`,
   };
 
-  return `${intentInstructions[intent]}\n\nDOMAIN: ${domain}\n\nREGULATION CONTEXT:\n${ruleContext}\n\nQUESTION: ${query}`;
+  return `${intentInstructions[intent]}
+
+DOMAIN: ${domain}
+
+REGULATION CONTEXT:
+${ruleContext}
+
+QUESTION: ${query}
+
+Answer now. No preamble.`;
 }
 
 function extractKeywordsFromQuery(query: string): string[] {
@@ -387,22 +551,15 @@ function buildModelMetadata(
   };
 }
 
+// ── Rule-based CAD node lookup (primary) ─────────────────────────────────────
 async function fetchCadNodesForRules(
   ruleIds: string[],
   requestId: string,
 ): Promise<CadNodeMatch[]> {
   if (ruleIds.length === 0) return [];
-
   try {
-    const { data, error } = await supabase.rpc('match_cad_nodes_by_prefix', {
-      rule_ids: ruleIds,
-    });
-
-    if (error) {
-      logger.error('match_cad_nodes_by_prefix RPC error', error, { requestId });
-      return [];
-    }
-
+    const { data, error } = await supabase.rpc('match_cad_nodes_by_prefix', { rule_ids: ruleIds });
+    if (error) { logger.error('match_cad_nodes_by_prefix RPC error', error, { requestId }); return []; }
     return (data ?? []) as CadNodeMatch[];
   } catch (err) {
     logger.error('fetchCadNodesForRules threw', err, { requestId });
@@ -410,8 +567,61 @@ async function fetchCadNodesForRules(
   }
 }
 
+// ── NEW v13: Keyword-based CAD lookup (secondary shield) ─────────────────────
+// Queries cad_keyword_map table using ilike keyword matching.
+// Returns highlight_meshes (orange) and context_meshes (translucent) separately.
+async function fetchCadByKeyword(
+  query: string,
+  requestId: string,
+): Promise<CadKeywordMatch | null> {
+  try {
+    const { data, error } = await supabase
+      .from('cad_keyword_map')
+      .select('model_id, keyword, highlight_meshes, context_meshes');
+
+    if (error || !data) return null;
+
+    const lowerQuery = query.toLowerCase();
+
+    // Sort by length descending to match longest keywords first (e.g., "front bulkhead" before "bulkhead")
+    const match = data
+      .sort((a, b) => b.keyword.length - a.keyword.length)
+      .find(row => lowerQuery.includes(row.keyword.toLowerCase()));
+
+    if (!match) return null;
+
+    return {
+      model_id: match.model_id,
+      highlight_meshes: match.highlight_meshes,
+      context_meshes: match.context_meshes
+    };
+  } catch (err) {
+    return null;
+  }
+}
+async function fetchModelById(
+  modelId: number,
+  requestId: string,
+): Promise<ModelRecord | null> {
+  try {
+    const { data, error } = await supabase
+      .from('fb_models')
+      .select('*, model_rule_tags(rule_id)')
+      .eq('id', modelId)
+      .single();
+
+    if (error || !data) {
+      logger.warn(`[CAD] fetchModelById: no model for id=${modelId}`, { requestId });
+      return null;
+    }
+    return data as ModelRecord;
+  } catch (err) {
+    logger.error('fetchModelById threw', err, { requestId });
+    return null;
+  }
+}
 // ============================================================================
-// ── 9. MIDDLEWARE
+// ── 11. MIDDLEWARE
 // ============================================================================
 
 async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -419,7 +629,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
   if (!token) {
-    res.status(401).json({ error: 'Unauthorized: No token provided.' });
+    res.status(401).json({ error: 'Unauthorized: No token provided.', code: 'NO_TOKEN' });
     return;
   }
 
@@ -435,7 +645,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
   try {
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
-      res.status(401).json({ error: 'Unauthorized: Invalid or expired session.' });
+      res.status(401).json({ error: 'Unauthorized: Invalid or expired session.', code: 'INVALID_TOKEN' });
       return;
     }
 
@@ -446,7 +656,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
       .single();
 
     if (dbError || !teamMember || teamMember.is_approved === false) {
-      res.status(403).json({ error: 'ACCOUNT_PENDING', message: 'Your account is pending team lead approval.' });
+      res.status(403).json({ error: 'Your account is pending team lead approval.', code: 'ACCOUNT_PENDING' });
       return;
     }
 
@@ -455,7 +665,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
     next();
   } catch (err) {
     logger.error('Authentication error', err);
-    res.status(500).json({ error: 'Authentication system error.' });
+    res.status(500).json({ error: 'Authentication system error.', code: 'AUTH_ERROR' });
   }
 }
 
@@ -464,7 +674,7 @@ const askLimiter = rateLimit({
   max: CONFIG.ASK_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many queries. Please wait a moment.' },
+  message: { error: 'Too many queries. Please wait a moment.', code: 'RATE_LIMITED' },
 });
 
 const generalLimiter = rateLimit({
@@ -472,6 +682,7 @@ const generalLimiter = rateLimit({
   max: CONFIG.RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait a moment.', code: 'RATE_LIMITED' },
 });
 
 app.use(helmet());
@@ -483,54 +694,30 @@ app.use(cors({
 }));
 
 // ============================================================================
-// ── 10. ROUTES
+// ── 12. ROUTES
 // ============================================================================
 
 app.get('/health', (_req: Request, res: Response): void => {
   const now = Date.now();
-  const rosterStatus = (roster: ModelSlot[]) =>
-    roster.map(s => ({
-      model: s.modelName,
-      label: s.label,
-      status: s.coolUntil > now ? 'cooling' : 'active',
-      coolRemaining: s.coolUntil > now ? `${Math.ceil((s.coolUntil - now) / 1000)}s` : null,
-      quotaHits: s.quotaHits,
-      successCount: s.successCount,
-    }));
+  const rosterSummary = (roster: ModelSlot[]) => ({
+    total: roster.length,
+    active: roster.filter(s => s.coolUntil <= now).length,
+    cooling: roster.filter(s => s.coolUntil > now).length,
+  });
   res.json({
     status: 'ok',
-    service: 'RAG Backend',
-    version: '11.1.0',
+    service: 'INDRA RAG Backend',
+    version: '13.0.0',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
-    primary_roster: rosterStatus(primaryRoster),
-    rerank_roster: rosterStatus(rerankRoster),
+    primary_roster: rosterSummary(primaryRoster),
+    rerank_roster: rosterSummary(rerankRoster),
   });
-});
-
-app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
-  const now = Date.now();
-  let active = 0, expired = 0;
-  for (const entry of semanticCache.values()) {
-    entry.expiresAt > now ? active++ : expired++;
-  }
-  res.json({ total_entries: semanticCache.size, active, expired });
-});
-
-app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: Response): void => {
-  if ((req as AuthenticatedRequest).user?.role !== 'admin') {
-    res.status(403).json({ error: 'Admin only.' });
-    return;
-  }
-  const cleared = semanticCache.size;
-  semanticCache.clear();
-  logger.info('Cache cleared by admin', { cleared });
-  res.json({ message: `Cleared ${cleared} cache entries.` });
 });
 
 app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response): void => {
   if ((req as AuthenticatedRequest).user?.role !== 'admin') {
-    res.status(403).json({ error: 'Admin only.' });
+    res.status(403).json({ error: 'Admin only.', code: 'FORBIDDEN' });
     return;
   }
   const now = Date.now();
@@ -550,6 +737,26 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
   });
 });
 
+app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
+  const now = Date.now();
+  let active = 0, expired = 0;
+  for (const entry of semanticCache.values()) {
+    entry.expiresAt > now ? active++ : expired++;
+  }
+  res.json({ total_entries: semanticCache.size, active, expired, max_entries: CONFIG.CACHE_MAX_ENTRIES });
+});
+
+app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: Response): void => {
+  if ((req as AuthenticatedRequest).user?.role !== 'admin') {
+    res.status(403).json({ error: 'Admin only.', code: 'FORBIDDEN' });
+    return;
+  }
+  const cleared = semanticCache.size;
+  semanticCache.clear();
+  logger.info('Cache cleared by admin', { cleared });
+  res.json({ message: `Cleared ${cleared} cache entries.` });
+});
+
 // ── Main RAG endpoint ────────────────────────────────────────────────────────
 app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const authReq = req as AuthenticatedRequest;
@@ -557,22 +764,29 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
   const { message, domain } = req.body as { message: unknown; domain: unknown };
 
   if (!message || typeof message !== 'string') {
-    res.status(400).json({ error: 'Invalid query: message must be a non-empty string.' });
+    res.status(400).json({ error: 'Invalid query: message must be a non-empty string.', code: 'INVALID_INPUT' });
     return;
   }
   const trimmed = message.trim();
   if (trimmed.length < CONFIG.MIN_MESSAGE_LENGTH) {
-    res.status(400).json({ error: `Query too short. Minimum ${CONFIG.MIN_MESSAGE_LENGTH} characters.` });
+    res.status(400).json({ error: `Query too short. Minimum ${CONFIG.MIN_MESSAGE_LENGTH} characters.`, code: 'QUERY_TOO_SHORT' });
     return;
   }
   if (trimmed.length > CONFIG.MAX_MESSAGE_LENGTH) {
-    res.status(400).json({ error: `Query too long. Maximum ${CONFIG.MAX_MESSAGE_LENGTH} characters.` });
+    res.status(400).json({ error: `Query too long. Maximum ${CONFIG.MAX_MESSAGE_LENGTH} characters.`, code: 'QUERY_TOO_LONG' });
     return;
   }
 
-  const sanitizedDomain = typeof domain === 'string' && domain.trim().length > 0
-    ? domain.trim()
-    : 'General';
+  if (detectInjection(trimmed)) {
+    logger.warn('[SECURITY] Prompt injection attempt detected', { requestId, query: trimmed.slice(0, 100) });
+    res.status(400).json({ error: 'Query contains disallowed patterns.', code: 'INJECTION_DETECTED' });
+    return;
+  }
+
+  const sanitizedDomain: string = (
+    typeof domain === 'string' &&
+    VALID_DOMAINS.includes(domain.trim() as ValidDomain)
+  ) ? domain.trim() : 'General';
 
   try {
     const intent = classifyIntent(trimmed);
@@ -586,11 +800,8 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       return;
     }
 
-    const embedding = expandedEmbedding;
-    const queryToUse = trimmed;
-
     const { data: matchedRules, error: rpcError } = await supabase.rpc('match_rulebook_chunks', {
-      query_embedding: embedding,
+      query_embedding: expandedEmbedding,
       match_threshold: CONFIG.MATCH_THRESHOLD,
       match_count: CONFIG.MATCH_COUNT,
       filter_domain: sanitizedDomain,
@@ -598,12 +809,12 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
     if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
 
-    // Step: Learned pairs + reranking in parallel
-    const [learnedMatches, rerankedRules] = await Promise.all([
+    // Run reranker, learned matches, and keyword CAD lookup in parallel
+    const [learnedMatches, rerankedRules, keywordCadMatch] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
         try {
           const { data } = await supabase.rpc('match_learned_chunks', {
-            query_embedding: embedding,
+            query_embedding: expandedEmbedding,
             match_threshold: CONFIG.LEARNED_MATCH_THRESHOLD,
             match_count: CONFIG.LEARNED_MATCH_COUNT,
           });
@@ -614,8 +825,10 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         }
       })(),
       matchedRules && (matchedRules as RuleChunk[]).length > 1
-        ? Promise.resolve(rerankChunks(queryToUse, matchedRules as RuleChunk[]))
+        ? rerankChunks(trimmed, matchedRules as RuleChunk[])
         : Promise.resolve((matchedRules ?? []) as RuleChunk[]),
+      // NEW v13: keyword CAD lookup runs in parallel — zero latency cost
+      fetchCadByKeyword(trimmed, requestId),
     ]);
 
     const hasRuleMatches    = rerankedRules.length > 0;
@@ -624,12 +837,24 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       .map(r => r.rule_id)
       .filter((id): id is string => Boolean(id));
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 3D model + CAD node lookup.
-    // ─────────────────────────────────────────────────────────────────────
+    // ── 3D Model resolution ──────────────────────────────────────────────────
     let topModel: ModelRecord | null = null;
+    let highlightMeshes: string[] = [];
+    let contextMeshes: string[] = [];
+    let cadNodes: CadNodeMatch[] = [];
 
-    if (hasRuleMatches && ruleIds.length > 0) {
+    // 1. PRIMARY: Trust your handcrafted keyword map FIRST (100% precision)
+    // 1. PRIMARY: Trust your handcrafted keyword map FIRST (100% precision)
+    if (keywordCadMatch && keywordCadMatch.model_id) {
+      // Cleaned up the 'as any' since we defined the function properly
+      topModel = await fetchModelById(keywordCadMatch.model_id as number, requestId);
+      
+      highlightMeshes = keywordCadMatch.highlight_meshes || [];
+      contextMeshes = keywordCadMatch.context_meshes || [];
+      logger.info('[DEMO SAVED] Used exact keyword map', { requestId, model: topModel?.name });
+    }
+    // 2. SECONDARY: Fallback to fuzzy rule tags ONLY if no keyword was found
+    else if (hasRuleMatches && ruleIds.length > 0) {
       const { data: tagRows, error: tagError } = await supabase
         .from('model_rule_tags')
         .select('rule_id, relevance_score, fb_models(*)')
@@ -641,10 +866,14 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       if (tagRows && tagRows.length > 0) {
         topModel = ((tagRows[0] as Record<string, unknown>).fb_models as ModelRecord) ?? null;
       }
+
+      cadNodes = await fetchCadNodesForRules(ruleIds, requestId);
+      highlightMeshes = [...new Set(cadNodes.map(n => n.cad_node_name))];
     }
 
+    // 3. FINAL FALLBACK: Category scan
     if (!topModel) {
-      const categories = extractKeywordsFromQuery(queryToUse);
+      const categories = extractKeywordsFromQuery(trimmed);
       if (categories.length > 0) {
         const { data: modelsByKeyword } = await supabase
           .from('fb_models')
@@ -657,48 +886,45 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       }
     }
 
-    // Prefix-match CAD node names for the 3D viewer
-    const cadNodes = await fetchCadNodesForRules(ruleIds, requestId);
+    logger.info('[CAD] Mesh resolution complete', {
+      requestId,
+      highlight_count: highlightMeshes.length,
+      context_count: contextMeshes.length,
+      source: (keywordCadMatch && keywordCadMatch.model_id) ? 'keyword-first' : 'rule-fallback',
+    });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 🌟 ENHANCED: Generic LLM Fallback (No Rules Found)
-    // ─────────────────────────────────────────────────────────────────────
+    // ── No match fallback ────────────────────────────────────────────────────
+    // NEW v13: no generic AI fallback — INDRA only answers from the rulebook.
+    // Returns clean no-match in INDRA voice. Still includes CAD if keyword matched.
     if (!hasRuleMatches && !hasLearnedMatches) {
-      logger.info('No specific rules found, engaging Generic Engineering Response.', { requestId });
+      logger.info('No rulebook match found', { requestId, domain: sanitizedDomain });
 
-      const genericPrompt = `You are an expert AI Technical Assistant. The user asked a question that is NOT explicitly covered in the "${sanitizedDomain}" regulations we have on file. 
-      
-      Provide a helpful, standard engineering or technical response to their query. 
-      CRITICAL: You MUST explicitly state at the beginning or end of your response that this is "General Advice" and NOT an official rulebook citation.
+      const noMatchPayload: Record<string, unknown> = {
+        answer: `**No rulebook match found in the ${sanitizedDomain} domain.**\n\n⚡ INDRA NOTE: Try rephrasing with specific component names or rule keywords. Switch domain if this is a cross-domain query.`,
+        citations: [],
+        intent: 'no_match',
+        code: 'NO_MATCH',
+      };
 
-      QUESTION: ${queryToUse}`;
+      // Still show 3D model if keyword matched a component — visual context is always useful
+      if (topModel?.file_url) {
+        noMatchPayload.model_url      = topModel.file_url;
+        noMatchPayload.model_metadata = buildModelMetadata(topModel, cadNodes, false);
+      }
+      if (highlightMeshes.length > 0) noMatchPayload.highlight_meshes = highlightMeshes;
+      if (contextMeshes.length > 0)   noMatchPayload.context_meshes   = contextMeshes;
 
-      // slightly higher temp (0.6) for standard problem solving
-      const genericAnswer = await generate(genericPrompt, false, 0.6); 
-
-      await saveLog({
+      saveLog({
         request_id: requestId, query: trimmed,
-        result: 'no_match_fallback', domain: sanitizedDomain, intent: 'general_engineering',
+        result: 'no_match', domain: sanitizedDomain, intent,
         created_at: new Date().toISOString(),
       });
 
-      const fallbackPayload: Record<string, unknown> = {
-        answer: genericAnswer,
-        citations: [],
-        intent: 'general_engineering',
-      };
-
-      if (topModel?.file_url) {
-        fallbackPayload.model_url      = topModel.file_url;
-        fallbackPayload.model_metadata = buildModelMetadata(topModel, cadNodes, false);
-        fallbackPayload.cad_nodes      = cadNodes;
-      }
-
-      res.json(fallbackPayload);
+      res.json(noMatchPayload);
       return;
     }
 
-    // Build context and generate final answer (Strict Rule-Based)
+    // ── Build rule context & generate answer ─────────────────────────────────
     const ruleContext = [
       ...rerankedRules.map(r =>
         `[Rule ${r.rule_id}${r.rerank_score !== undefined ? ` | Relevance: ${r.rerank_score.toFixed(2)}` : ''}]\n${r.content}`
@@ -709,10 +935,10 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         : []),
     ].join('\n\n---\n\n');
 
-    const systemPrompt = buildSystemPrompt(intent, ruleContext, queryToUse, sanitizedDomain);
+    const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
     const answer = await generate(systemPrompt, false, 0.35);
 
-    // Assemble response
+    // ── Build response payload ───────────────────────────────────────────────
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
@@ -737,14 +963,21 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       responsePayload.model_metadata = buildModelMetadata(topModel, cadNodes);
     }
 
-    responsePayload.cad_nodes = cadNodes;
+    // NEW v13: structured mesh arrays for frontend Three.js highlighting
+    // highlight_meshes → orange (directly relevant parts)
+    // context_meshes   → translucent (surrounding spatial reference parts)
+    // cad_nodes        → kept for backwards compatibility
+    responsePayload.highlight_meshes = highlightMeshes;
+    responsePayload.context_meshes   = contextMeshes;
+    responsePayload.cad_nodes        = cadNodes;
 
     writeCache(expandedEmbedding, sanitizedDomain, responsePayload);
 
-    await saveLog({
+    res.json(responsePayload);
+
+    saveLog({
       request_id:              requestId,
       query:                   trimmed,
-      corrected_query:         queryToUse !== trimmed ? queryToUse : null,
       result:                  'success',
       domain:                  sanitizedDomain,
       intent,
@@ -753,15 +986,17 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       citations_count:         rerankedRules.length,
       learned_citations_count: learnedMatches.length,
       cad_nodes_count:         cadNodes.length,
+      highlight_meshes_count:  highlightMeshes.length,
+      context_meshes_count:    contextMeshes.length,
+      keyword_cad_hit:         !!keywordCadMatch,
       cache_written:           true,
       created_at:              new Date().toISOString(),
     });
 
-    res.json(responsePayload);
-
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     const isQuotaExhausted = msg.toLowerCase().includes('quota_exhausted');
+    const isTimeout        = msg.startsWith('TIMEOUT:');
 
     logger.error('Error in /ask_indra', error, { requestId });
 
@@ -770,45 +1005,85 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         error: 'All AI capacity is temporarily at quota limit. Please try again in a minute.',
         code:  'QUOTA_EXHAUSTED',
       });
+    } else if (isTimeout) {
+      res.status(504).json({
+        error: 'The AI took too long to respond. Please try again.',
+        code:  'TIMEOUT',
+      });
     } else {
-      res.status(500).json({ error: 'The server encountered an error. Please try again.' });
+      res.status(500).json({ error: 'The server encountered an error. Please try again.', code: 'INTERNAL_ERROR' });
     }
   }
 });
 
 // ── Feedback & learning ──────────────────────────────────────────────────────
 app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
+  // Grab the auth details provided by your middleware
+  const authReq = req as AuthenticatedRequest;
+  const requestId = authReq.requestId;
+  const userId = authReq.user?.id; 
+
   const { question, answer, domain, rating } = req.body as {
     question: unknown; answer: unknown; domain: unknown; rating: unknown;
   };
 
+  // 1. SECURITY: Add MAX length checks to prevent database bloating/crashing
   if (
-    !question || typeof question !== 'string' || question.trim().length < 2 ||
-    !answer   || typeof answer   !== 'string' || answer.trim().length < 2   ||
-    !domain   || typeof domain   !== 'string' ||
+    typeof question !== 'string' || question.trim().length < 2 || question.length > 1000 ||
+    typeof answer   !== 'string' || answer.trim().length < 2   || answer.length > 5000 ||
+    typeof domain   !== 'string' ||
     !['good', 'bad'].includes(rating as string)
   ) {
-    res.status(400).json({ error: "Required fields: question (string), answer (string), domain (string), rating ('good'|'bad')" });
+    res.status(400).json({
+      error: "Invalid payload. Check field types and ensure lengths are within limits.",
+      code: 'INVALID_INPUT',
+    });
+    return;
+  }
+
+  const sanitizedDomain = domain.trim();
+
+  if (!VALID_DOMAINS.includes(sanitizedDomain as ValidDomain)) {
+    res.status(400).json({ error: 'Invalid domain.', code: 'INVALID_DOMAIN' });
     return;
   }
 
   try {
+    const trimmedQuestion = question.trim();
+    const trimmedAnswer = answer.trim();
+
+    // 2. SPEED: Run database saves in parallel
+    const dbTasks: Promise<void>[] = [];
+
     if (rating === 'good') {
-      await saveLearnedPair(question, answer, domain, 'user_feedback');
-      logger.info('Learned pair saved from feedback', { question: question.slice(0, 60) });
+      dbTasks.push(saveLearnedPair(trimmedQuestion, trimmedAnswer, sanitizedDomain, 'user_feedback'));
+      logger.info('Learned pair saved from feedback', { requestId, userId, question: trimmedQuestion.slice(0, 60) });
     }
-    await saveLog({ type: 'feedback', question, domain, rating, created_at: new Date().toISOString() });
+
+    // 3. RELIABILITY: Now wrapped in a Promise to await
+    dbTasks.push(saveLog({ 
+      request_id: requestId,
+      user_id: userId, // ATTRIBUTION: Know who gave the feedback
+      type: 'feedback', 
+      question: trimmedQuestion, 
+      domain: sanitizedDomain, 
+      rating, 
+      created_at: new Date().toISOString() 
+    }));
+
+    // Wait for all DB operations to finish simultaneously
+    await Promise.all(dbTasks);
+
     res.json({
       message: rating === 'good'
         ? 'Answer learned — thanks for the signal!'
         : 'Feedback noted. We will work to improve.',
     });
   } catch (err) {
-    logger.error('Feedback save error', err);
-    res.status(500).json({ error: 'Failed to save feedback.' });
+    logger.error('Feedback save error', err, { requestId });
+    res.status(500).json({ error: 'Failed to save feedback.', code: 'INTERNAL_ERROR' });
   }
 });
-
 // ── 3D Model gallery ─────────────────────────────────────────────────────────
 app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { category, limit = '20', offset = '0', search } = req.query;
@@ -833,14 +1108,14 @@ app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Respon
     res.json({ models: data, total: count, has_more: count ? count > parsedOffset + parsedLimit : false });
   } catch (err) {
     logger.error('Error fetching models', err);
-    res.status(500).json({ error: 'Failed to fetch model library.' });
+    res.status(500).json({ error: 'Failed to fetch model library.', code: 'INTERNAL_ERROR' });
   }
 });
 
 app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   if (!/^[\w-]+$/.test(id)) {
-    res.status(400).json({ error: 'Invalid model ID.' });
+    res.status(400).json({ error: 'Invalid model ID.', code: 'INVALID_INPUT' });
     return;
   }
   try {
@@ -851,13 +1126,13 @@ app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Re
       .single();
 
     if (error || !data) {
-      res.status(404).json({ error: 'Model not found.' });
+      res.status(404).json({ error: 'Model not found.', code: 'NOT_FOUND' });
       return;
     }
     res.json(data);
   } catch (err) {
     logger.error('Error fetching model by ID', err, { id });
-    res.status(500).json({ error: 'Failed to fetch model details.' });
+    res.status(500).json({ error: 'Failed to fetch model details.', code: 'INTERNAL_ERROR' });
   }
 });
 
@@ -865,6 +1140,11 @@ app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Re
 app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { domain = 'General', count = '3' } = req.query;
   const questionCount = Math.min(Math.max(Number(count) || 3, 1), 10);
+
+  if (!VALID_DOMAINS.includes((domain as string).trim() as ValidDomain)) {
+    res.status(400).json({ error: 'Invalid domain.', code: 'INVALID_DOMAIN' });
+    return;
+  }
 
   try {
     const { data: chunks } = await supabase
@@ -874,7 +1154,7 @@ app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response
       .limit(questionCount * 3);
 
     if (!chunks || chunks.length === 0) {
-      res.status(404).json({ error: 'No rulebook content found for this domain.' });
+      res.status(404).json({ error: 'No rulebook content found for this domain.', code: 'NOT_FOUND' });
       return;
     }
 
@@ -898,40 +1178,42 @@ correctAnswer is the 0-based index of the correct option.
 REGULATION EXCERPTS:
 ${context}`;
 
-    const raw      = await generate(prompt, true, 0.4);
-    const cleaned  = raw.replace(/```json|```/g, '').trim();
+    const raw       = await generate(prompt, true, 0.4);
+    const cleaned   = raw.replace(/```json|```/g, '').trim();
     const questions = JSON.parse(cleaned);
 
     if (!Array.isArray(questions)) throw new Error('Invalid quiz generation response');
     res.json({ questions, domain, generated: true });
   } catch (err) {
     logger.error('Quiz generation error', err);
-    res.status(500).json({ error: 'Failed to generate quiz questions.' });
+    res.status(500).json({ error: 'Failed to generate quiz questions.', code: 'INTERNAL_ERROR' });
   }
 });
 
 // ============================================================================
-// ── 11. ERROR HANDLING & STARTUP
+// ── 13. ERROR HANDLING & STARTUP
 // ============================================================================
 
 app.use((_req: Request, res: Response): void => {
-  res.status(404).json({ error: 'Route not found.' });
+  res.status(404).json({ error: 'Route not found.', code: 'NOT_FOUND' });
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void => {
   logger.error('Unhandled error', error);
-  res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  res.status(500).json({ error: 'Something went wrong. Please try again.', code: 'INTERNAL_ERROR' });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀  RAG Backend v11.1.0`);
+  console.log(`\n🚀  INDRA RAG Backend v13.0.0`);
   console.log(`🌐  http://localhost:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
-  console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth`);
+  console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
-  console.log(`🔑  Rerank key   : ${rerankRoster.length} models (dedicated, fallback to primary)`);
-  console.log(`🧠  RAG Engine   : Vector search → Cosine Rerank → Prefix CAD Match → Generic Fallback`);
-  console.log(`⚡  Cache        : Semantic in-memory (TTL: ${CONFIG.CACHE_TTL_MS / 60000}min)`);
-  console.log(`🔩  CAD Nodes    : Prefix-match rule linking enabled\n`);
+  console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
+  console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
+  console.log(`🔩  CAD Layer    : Rule-based primary + Keyword secondary → highlight_meshes + context_meshes`);
+  console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
+  console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per Gemini call`);
+  console.log(`🚫  Fallback     : No generic AI fallback — INDRA answers from rulebook only\n`);
 });
