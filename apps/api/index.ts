@@ -52,7 +52,7 @@ const CONFIG = {
   RATE_LIMIT_MAX: IS_PROD ? 15 : 50,
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
-  EMBEDDING_MODEL: 'models/text-embedding-004',
+  EMBEDDING_MODEL: 'models/gemini-embedding-2-flash',
   MODEL_COOLDOWN_MS: 60 * 1000,
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
@@ -340,15 +340,46 @@ async function generate(
 // ── 7. EMBEDDINGS
 // ============================================================================
 
-async function embedText(text: string, taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'): Promise<number[]> {
-  const client = primaryRoster[0].client;
-  const embeddingModel = client.getGenerativeModel({ model: CONFIG.EMBEDDING_MODEL });
-  const result = await embeddingModel.embedContent({
-    content: { parts: [{ text }], role: 'user' },
-    taskType: taskType as never,
-    outputDimensionality: 768,
-  } as never);
-  return result.embedding.values;
+async function embedText(
+  text: string, 
+  taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'
+): Promise<number[]> {
+  try {
+    // 1. Use the new 2026 multimodal embedding model
+    const client = primaryRoster[0].client;
+    const embeddingModel = client.getGenerativeModel({ 
+      model: 'gemini-embedding-2-flash' 
+    });
+
+    // 2. Request 768 dimensions explicitly
+    const result = await embeddingModel.embedContent({
+      content: { parts: [{ text }], role: 'user' },
+      taskType: taskType as any,
+      outputDimensionality: 768,
+    } as any);
+
+    let embedding = result.embedding.values;
+
+    // 3. SAFETY: Manual truncation in case the API ignores outputDimensionality
+    if (embedding.length > 768) {
+      embedding = embedding.slice(0, 768);
+    }
+
+    return embedding;
+  } catch (err: any) {
+    const isLocationError = err.message?.includes('location is not supported');
+    
+    // 4. LOGGING: Specific error tracking for your Render region
+    if (isLocationError) {
+      logger.error('[EMBED] Regional Block: Render datacenter geofenced by Google.', { text: text.slice(0, 30) });
+    } else {
+      logger.error('[EMBED] Failed to generate embedding', err);
+    }
+
+    // 5. EMERGENCY FALLBACK: Return a zero-vector
+    // This allows INDRA to proceed to the Keyword Shield logic instead of crashing
+    return new Array(768).fill(0);
+  }
 }
 
 const embedQuery = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
