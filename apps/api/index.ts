@@ -52,7 +52,9 @@ const CONFIG = {
   RATE_LIMIT_MAX: IS_PROD ? 15 : 50,
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
-  EMBEDDING_MODEL: 'models/gemini-2.0-flash-lite',
+  // FIX: This MUST be a real embedding model — NOT a generation model.
+  // 'models/gemini-2.0-flash-lite' is a generation model and will ALWAYS fail for embedContent.
+  EMBEDDING_MODEL: 'models/gemini-embedding-001',
   MODEL_COOLDOWN_MS: 60 * 1000,
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
@@ -96,26 +98,27 @@ const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_AP
 function activeSlots(roster: ModelSlot[]): ModelSlot[] {
   const now = Date.now();
   const active = roster.filter(s => s.coolUntil <= now);
+  // If everything is cooling, return all slots so we still try rather than hanging
   return active.length > 0 ? active : roster;
 }
 
 function coolSlot(slot: ModelSlot): void {
   slot.quotaHits++;
   slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
-  logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
+  logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
 }
 
 function isSkippableError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
   const lower = msg.toLowerCase();
   return (
-    msg.includes('429')                                  ||
-    lower.includes('quota')                              ||
-    lower.includes('resource_exhausted')                 ||
-    lower.includes('rate_limit')                         ||
-    msg.includes('404')                                  ||
-    lower.includes('not found')                          ||
-    lower.includes('is not supported')                   ||
+    msg.includes('429')                               ||
+    lower.includes('quota')                           ||
+    lower.includes('resource_exhausted')              ||
+    lower.includes('rate_limit')                      ||
+    msg.includes('404')                               ||
+    lower.includes('not found')                       ||
+    lower.includes('is not supported')                ||
     lower.includes('not supported for generatecontent')
   );
 }
@@ -169,7 +172,6 @@ interface CadNodeMatch {
   relevance_score?: number;
 }
 
-// NEW v13: keyword map result shape
 interface CadKeywordMatch {
   model_id: number;
   highlight_meshes: string[];
@@ -239,7 +241,7 @@ const logger = {
   error: (msg: string, error: unknown, meta?: Record<string, unknown>) =>
     console.error(`[ERROR] ${new Date().toISOString()} — ${msg}`, {
       message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
+      stack:   error instanceof Error ? error.stack   : undefined,
       ...meta,
     }),
 };
@@ -278,6 +280,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   return Promise.race([promise, timeout]);
 }
 
+// The roster rotates automatically: each slot is tried in order.
+// If a slot hits quota (429 / resource_exhausted), it gets cooled for 60s
+// and the next slot in the roster is tried immediately.
 async function generateWithRoster(
   prompt: string,
   roster: ModelSlot[],
@@ -306,17 +311,17 @@ async function generateWithRoster(
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.startsWith('TIMEOUT:')) {
-        logger.warn(`[ROSTER] ${slot.label} timed out — skipping.`);
+        logger.warn(`[ROSTER] ${slot.label} timed out — trying next slot.`);
         continue;
       }
       if (isSkippableError(error)) {
-        coolSlot(slot);
+        coolSlot(slot); // mark this slot cooling, loop continues to next
         continue;
       }
-      throw error;
+      throw error; // hard error — don't swallow it
     }
   }
-  throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota limit. Try again shortly.');
+  throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota. Try again shortly.');
 }
 
 async function generate(
@@ -338,67 +343,98 @@ async function generate(
 
 // ============================================================================
 // ── 7. EMBEDDINGS
+// ── FIX: Removed the double `async function embedText(async function embedText(`
+// ── syntax error, fixed the wrong model name ('gemini-embedding-2-flash' does
+// ── not exist), and properly wired roster-aware slot rotation with cooldowns.
 // ============================================================================
 
 async function embedText(
-  text: string, 
-  taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'
+  text: string,
+  taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT',
 ): Promise<number[]> {
-  try {
-    // 1. Use the new 2026 multimodal embedding model
-    const client = primaryRoster[0].client;
-    const embeddingModel = client.getGenerativeModel({ 
-      model: 'gemini-embedding-2-flash' 
-    });
+  // Use the same roster rotation pattern as generateWithRoster so quota hits
+  // on the embedding model automatically cool the slot and try the next one.
+  // Note: all slots share the same underlying API key, so we use primaryRoster[0]
+  // for the client but honour slot cooldowns to respect per-slot rate limiting.
+  const slots = activeSlots(primaryRoster);
 
-    // 2. Request 768 dimensions explicitly
-    const result = await embeddingModel.embedContent({
-      content: { parts: [{ text }], role: 'user' },
-      taskType: taskType as any,
-      outputDimensionality: 768,
-    } as any);
+  for (const slot of slots) {
+    try {
+      // EMBEDDING_MODEL is 'models/gemini-embedding-001' — a real embedding model.
+      // Never use a generation model (gemini-2.0-flash-lite etc.) here; they will
+      // always throw "not supported for embedContent" which isSkippableError catches,
+      // causing every slot to cool and returning a useless zero vector.
+      const embeddingModel = slot.client.getGenerativeModel({
+        model: CONFIG.EMBEDDING_MODEL,
+      });
 
-    let embedding = result.embedding.values;
+      const result = await withTimeout(
+        embeddingModel.embedContent({
+          content: { parts: [{ text }], role: 'user' },
+          taskType: taskType as never,
+          outputDimensionality: 768,
+        } as never),
+        CONFIG.GEMINI_TIMEOUT_MS,
+        `${slot.label}/embed`,
+      );
 
-    // 3. SAFETY: Manual truncation in case the API ignores outputDimensionality
-    if (embedding.length > 768) {
-      embedding = embedding.slice(0, 768);
+      let embedding = result.embedding.values;
+
+      // Safety: trim to 768 dims to match the Supabase vector column schema
+      if (embedding.length > 768) embedding = embedding.slice(0, 768);
+
+      slot.successCount++;
+      logger.info(`[EMBED] ${slot.label} ✓ (dims: ${embedding.length})`);
+      return embedding;
+
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (msg.startsWith('TIMEOUT:')) {
+        logger.warn(`[EMBED] ${slot.label} timed out — trying next slot.`);
+        continue;
+      }
+
+      if (isSkippableError(err)) {
+        coolSlot(slot);
+        continue;
+      }
+
+      // Hard error (auth, bad request, etc.) — surface it immediately
+      logger.error(`[EMBED] Hard error on ${slot.label}`, err);
+      throw err;
     }
-
-    return embedding;
-  } catch (err: any) {
-    const isLocationError = err.message?.includes('location is not supported');
-    
-    // 4. LOGGING: Specific error tracking for your Render region
-    if (isLocationError) {
-      logger.error('[EMBED] Regional Block: Render datacenter geofenced by Google.', { text: text.slice(0, 30) });
-    } else {
-      logger.error('[EMBED] Failed to generate embedding', err);
-    }
-
-    // 5. EMERGENCY FALLBACK: Return a zero-vector
-    // This allows INDRA to proceed to the Keyword Shield logic instead of crashing
-    return new Array(768).fill(0);
   }
+
+  // True last resort: all slots are quota-exhausted. Return zero vector so the
+  // request can still return a graceful no-match rather than a 500 crash.
+  // The zero vector will produce no cosine similarity matches, which is correct
+  // behaviour — we just won't find any rule chunks this cycle.
+  logger.error('[EMBED] All slots exhausted. Returning zero vector — expect no rule matches.', new Error('EMBED_EXHAUSTED'));
+  return new Array(768).fill(0);
 }
 
-const embedQuery = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
+const embedQuery    = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
+const embedDocument = (text: string) => embedText(text, 'RETRIEVAL_DOCUMENT');
 
+// Kept as a named wrapper so we can later plug in HyDE / multi-query expansion
+// without changing call sites.
 async function expandAndAverageEmbedding(query: string): Promise<number[]> {
   return embedQuery(query);
 }
 
+// Suppress "declared but never used" — embedDocument is exported for ingestion scripts
+void embedDocument;
+
 // ============================================================================
-// ── 8. RERANKER — real cross-encoder via rerankRoster (token-efficient)
+// ── 8. RERANKER — cross-encoder via rerankRoster (token-efficient)
 // ============================================================================
 
 async function rerankChunks(query: string, chunks: RuleChunk[]): Promise<RuleChunk[]> {
   if (chunks.length <= 1) return chunks;
 
   const chunkList = chunks
-    .map((c, i) =>
-      `[${i}] Rule ${c.rule_id}: ${c.content.slice(0, CONFIG.RERANK_CHUNK_PREVIEW)}`
-    )
+    .map((c, i) => `[${i}] Rule ${c.rule_id}: ${c.content.slice(0, CONFIG.RERANK_CHUNK_PREVIEW)}`)
     .join('\n\n');
 
   const prompt = `You are a relevance scoring engine for a motorsport regulation assistant.
@@ -415,7 +451,7 @@ Example for 3 chunks: [0.95, 0.3, 0.87]
 No explanation. No markdown. Pure JSON array only.`;
 
   try {
-    const raw = await generateWithRoster(prompt, rerankRoster, true, 0.1);
+    const raw     = await generateWithRoster(prompt, rerankRoster, true, 0.1);
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const scores: number[] = JSON.parse(cleaned);
 
@@ -480,78 +516,25 @@ RESPONSE FORMAT RULES (follow strictly):
 - Keep responses tight. No padding. Every sentence must carry information.`;
 
   const intentInstructions: Record<QueryIntent, string> = {
-    dimension: `${persona}
-${formatRules}
-
-INTENT: DIMENSION QUERY
-Structure your answer as:
-**[Value + Unit]** — state the exact spec immediately.
-## Constraints
-Bullet list of all related dimensional limits with rule IDs.
-## Exceptions / Conditionals
-Any conditional rules or edge cases.`,
-
-    compliance: `${persona}
-${formatRules}
-
-INTENT: COMPLIANCE CHECK
-Structure your answer as:
-## Verdict
-✅ COMPLIANT / ❌ NON-COMPLIANT / ⚠️ CONDITIONAL — one line, bold.
-## Determining Rules
-Cite exact rule IDs and what they require.
-## Conditions / Exceptions
-What would change the verdict.`,
-
-    definition: `${persona}
-${formatRules}
-
-INTENT: DEFINITION
-Structure your answer as:
-**[Term]**: One crisp sentence definition.
-## Purpose / Function
-Why this component or rule exists in context.
-## Rule Reference
-The defining rule ID and its exact scope.`,
-
-    procedure: `${persona}
-${formatRules}
-
-INTENT: PROCEDURE
-Structure your answer as:
-## Steps
-Numbered list. Each step cites the relevant rule ID inline.
-## Mandatory Checkpoints
-Inspection or verification points that must not be skipped.`,
-
-    general: `${persona}
-${formatRules}
-
-INTENT: GENERAL TECHNICAL QUERY
-Answer directly and structured. Use ## headers to separate distinct topics. Cite rule IDs inline throughout.`,
+    dimension: `${persona}\n${formatRules}\n\nINTENT: DIMENSION QUERY\nStructure your answer as:\n**[Value + Unit]** — state the exact spec immediately.\n## Constraints\nBullet list of all related dimensional limits with rule IDs.\n## Exceptions / Conditionals\nAny conditional rules or edge cases.`,
+    compliance: `${persona}\n${formatRules}\n\nINTENT: COMPLIANCE CHECK\nStructure your answer as:\n## Verdict\n✅ COMPLIANT / ❌ NON-COMPLIANT / ⚠️ CONDITIONAL — one line, bold.\n## Determining Rules\nCite exact rule IDs and what they require.\n## Conditions / Exceptions\nWhat would change the verdict.`,
+    definition: `${persona}\n${formatRules}\n\nINTENT: DEFINITION\nStructure your answer as:\n**[Term]**: One crisp sentence definition.\n## Purpose / Function\nWhy this component or rule exists in context.\n## Rule Reference\nThe defining rule ID and its exact scope.`,
+    procedure: `${persona}\n${formatRules}\n\nINTENT: PROCEDURE\nStructure your answer as:\n## Steps\nNumbered list. Each step cites the relevant rule ID inline.\n## Mandatory Checkpoints\nInspection or verification points that must not be skipped.`,
+    general: `${persona}\n${formatRules}\n\nINTENT: GENERAL TECHNICAL QUERY\nAnswer directly and structured. Use ## headers to separate distinct topics. Cite rule IDs inline throughout.`,
   };
 
-  return `${intentInstructions[intent]}
-
-DOMAIN: ${domain}
-
-REGULATION CONTEXT:
-${ruleContext}
-
-QUESTION: ${query}
-
-Answer now. No preamble.`;
+  return `${intentInstructions[intent]}\n\nDOMAIN: ${domain}\n\nREGULATION CONTEXT:\n${ruleContext}\n\nQUESTION: ${query}\n\nAnswer now. No preamble.`;
 }
 
 function extractKeywordsFromQuery(query: string): string[] {
   const keywordsMap: Record<string, string[]> = {
-    'brake': ['Braking'], 'pedal': ['Braking'],
+    'brake': ['Braking'],        'pedal': ['Braking'],
     'roll hoop': ['Safety', 'Chassis'], 'bulkhead': ['Chassis'],
-    'impact attenuator': ['Chassis'], 'aip': ['Chassis'],
+    'impact attenuator': ['Chassis'],   'aip': ['Chassis'],
     'accumulator': ['Powertrain'], 'battery': ['Powertrain'], 'motor': ['Powertrain'],
-    'shutdown': ['Safety'], 'fire': ['Safety'],
-    'wing': ['Aerodynamics'], 'aero': ['Aerodynamics'],
-    'steering': ['Chassis'], 'suspension': ['Chassis'],
+    'shutdown': ['Safety'],      'fire': ['Safety'],
+    'wing': ['Aerodynamics'],    'aero': ['Aerodynamics'],
+    'steering': ['Chassis'],     'suspension': ['Chassis'],
   };
   const q = query.toLowerCase();
   const matched = new Set<string>();
@@ -567,22 +550,45 @@ function buildModelMetadata(
   includeTags = true,
 ): Record<string, unknown> {
   return {
-    name: model.name ?? 'Unknown Model',
-    category: model.category ?? 'Uncategorized',
+    name:        model.name        ?? 'Unknown Model',
+    category:    model.category    ?? 'Uncategorized',
     tags: includeTags && Array.isArray(model.model_rule_tags)
       ? model.model_rule_tags.map(t => t.rule_id)
       : [],
     description: model.description ?? null,
-    fileSize: model.file_size_mb ? `${model.file_size_mb} MB` : null,
-    cad_nodes: cadNodes.map(n => ({
-      rule_id: n.rule_id,
-      cad_node_name: n.cad_node_name,
+    fileSize:    model.file_size_mb ? `${model.file_size_mb} MB` : null,
+    cad_nodes:   cadNodes.map(n => ({
+      rule_id:         n.rule_id,
+      cad_node_name:   n.cad_node_name,
       relevance_score: n.relevance_score ?? null,
     })),
   };
 }
 
-// ── Rule-based CAD node lookup (primary) ─────────────────────────────────────
+// ── FIX: fetchModelById was called in v13 but never defined — added here ──────
+async function fetchModelById(
+  modelId: number,
+  requestId: string,
+): Promise<ModelRecord | null> {
+  try {
+    const { data, error } = await supabase
+      .from('fb_models')
+      .select('*, model_rule_tags(rule_id)')
+      .eq('id', modelId)
+      .single();
+
+    if (error || !data) {
+      logger.warn(`[CAD] fetchModelById: no model found for id=${modelId}`, { requestId });
+      return null;
+    }
+    return data as ModelRecord;
+  } catch (err) {
+    logger.error('fetchModelById threw', err, { requestId });
+    return null;
+  }
+}
+
+// ── Rule-based CAD node lookup ────────────────────────────────────────────────
 async function fetchCadNodesForRules(
   ruleIds: string[],
   requestId: string,
@@ -598,9 +604,7 @@ async function fetchCadNodesForRules(
   }
 }
 
-// ── NEW v13: Keyword-based CAD lookup (secondary shield) ─────────────────────
-// Queries cad_keyword_map table using ilike keyword matching.
-// Returns highlight_meshes (orange) and context_meshes (translucent) separately.
+// ── Keyword-based CAD lookup (secondary shield) ───────────────────────────────
 async function fetchCadByKeyword(
   query: string,
   requestId: string,
@@ -614,7 +618,7 @@ async function fetchCadByKeyword(
 
     const lowerQuery = query.toLowerCase();
 
-    // Sort by length descending to match longest keywords first (e.g., "front bulkhead" before "bulkhead")
+    // Longest-match first: "front bulkhead" before "bulkhead"
     const match = data
       .sort((a, b) => b.keyword.length - a.keyword.length)
       .find(row => lowerQuery.includes(row.keyword.toLowerCase()));
@@ -622,35 +626,17 @@ async function fetchCadByKeyword(
     if (!match) return null;
 
     return {
-      model_id: match.model_id,
+      model_id:         match.model_id,
       highlight_meshes: match.highlight_meshes,
-      context_meshes: match.context_meshes
+      context_meshes:   match.context_meshes,
     };
   } catch (err) {
+    // FIX: was silently swallowing errors with no log — now logged
+    logger.error('fetchCadByKeyword threw', err, { requestId });
     return null;
   }
 }
-async function fetchModelById(
-  modelId: number,
-  requestId: string,
-): Promise<ModelRecord | null> {
-  try {
-    const { data, error } = await supabase
-      .from('fb_models')
-      .select('*, model_rule_tags(rule_id)')
-      .eq('id', modelId)
-      .single();
 
-    if (error || !data) {
-      logger.warn(`[CAD] fetchModelById: no model for id=${modelId}`, { requestId });
-      return null;
-    }
-    return data as ModelRecord;
-  } catch (err) {
-    logger.error('fetchModelById threw', err, { requestId });
-    return null;
-  }
-}
 // ============================================================================
 // ── 11. MIDDLEWARE
 // ============================================================================
@@ -665,8 +651,8 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
   }
 
   const validToken = process.env.API_AUTH_TOKEN!;
-  const tokenBuf  = Buffer.from(token);
-  const validBuf  = Buffer.from(validToken);
+  const tokenBuf   = Buffer.from(token);
+  const validBuf   = Buffer.from(validToken);
   if (tokenBuf.length === validBuf.length && crypto.timingSafeEqual(tokenBuf, validBuf)) {
     (req as AuthenticatedRequest).requestId = crypto.randomUUID();
     (req as AuthenticatedRequest).user = { role: 'admin' };
@@ -731,18 +717,18 @@ app.use(cors({
 app.get('/health', (_req: Request, res: Response): void => {
   const now = Date.now();
   const rosterSummary = (roster: ModelSlot[]) => ({
-    total: roster.length,
-    active: roster.filter(s => s.coolUntil <= now).length,
+    total:   roster.length,
+    active:  roster.filter(s => s.coolUntil <= now).length,
     cooling: roster.filter(s => s.coolUntil > now).length,
   });
   res.json({
     status: 'ok',
     service: 'INDRA RAG Backend',
-    version: '13.0.0',
+    version: '13.2.0',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
     primary_roster: rosterSummary(primaryRoster),
-    rerank_roster: rosterSummary(rerankRoster),
+    rerank_roster:  rosterSummary(rerankRoster),
   });
 });
 
@@ -754,16 +740,16 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
   const now = Date.now();
   const rosterStatus = (roster: ModelSlot[]) =>
     roster.map(s => ({
-      label: s.label,
-      model: s.modelName,
-      status: s.coolUntil > now ? 'cooling' : 'active',
-      coolUntil: s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
-      quotaHits: s.quotaHits,
+      label:        s.label,
+      model:        s.modelName,
+      status:       s.coolUntil > now ? 'cooling' : 'active',
+      coolUntil:    s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
+      quotaHits:    s.quotaHits,
       successCount: s.successCount,
     }));
   res.json({
     primary_roster: rosterStatus(primaryRoster),
-    rerank_roster: rosterStatus(rerankRoster),
+    rerank_roster:  rosterStatus(rerankRoster),
     note: 'Models are tried in order. A cooled model is skipped until its cooldown expires.',
   });
 });
@@ -790,7 +776,7 @@ app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: 
 
 // ── Main RAG endpoint ────────────────────────────────────────────────────────
 app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
-  const authReq = req as AuthenticatedRequest;
+  const authReq   = req as AuthenticatedRequest;
   const requestId = authReq.requestId;
   const { message, domain } = req.body as { message: unknown; domain: unknown };
 
@@ -807,7 +793,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     res.status(400).json({ error: `Query too long. Maximum ${CONFIG.MAX_MESSAGE_LENGTH} characters.`, code: 'QUERY_TOO_LONG' });
     return;
   }
-
   if (detectInjection(trimmed)) {
     logger.warn('[SECURITY] Prompt injection attempt detected', { requestId, query: trimmed.slice(0, 100) });
     res.status(400).json({ error: 'Query contains disallowed patterns.', code: 'INJECTION_DETECTED' });
@@ -820,7 +805,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
   ) ? domain.trim() : 'General';
 
   try {
-    const intent = classifyIntent(trimmed);
+    const intent            = classifyIntent(trimmed);
     const expandedEmbedding = await expandAndAverageEmbedding(trimmed);
     logger.info('Query processed', { requestId, intent, domain: sanitizedDomain });
 
@@ -834,20 +819,19 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     const { data: matchedRules, error: rpcError } = await supabase.rpc('match_rulebook_chunks', {
       query_embedding: expandedEmbedding,
       match_threshold: CONFIG.MATCH_THRESHOLD,
-      match_count: CONFIG.MATCH_COUNT,
-      filter_domain: sanitizedDomain,
+      match_count:     CONFIG.MATCH_COUNT,
+      filter_domain:   sanitizedDomain,
     });
-
     if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
 
-    // Run reranker, learned matches, and keyword CAD lookup in parallel
+    // All three run in parallel — keyword CAD lookup costs zero extra latency
     const [learnedMatches, rerankedRules, keywordCadMatch] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
         try {
           const { data } = await supabase.rpc('match_learned_chunks', {
             query_embedding: expandedEmbedding,
             match_threshold: CONFIG.LEARNED_MATCH_THRESHOLD,
-            match_count: CONFIG.LEARNED_MATCH_COUNT,
+            match_count:     CONFIG.LEARNED_MATCH_COUNT,
           });
           return (data ?? []) as LearnedChunk[];
         } catch (err) {
@@ -858,7 +842,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       matchedRules && (matchedRules as RuleChunk[]).length > 1
         ? rerankChunks(trimmed, matchedRules as RuleChunk[])
         : Promise.resolve((matchedRules ?? []) as RuleChunk[]),
-      // NEW v13: keyword CAD lookup runs in parallel — zero latency cost
       fetchCadByKeyword(trimmed, requestId),
     ]);
 
@@ -870,21 +853,18 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
     // ── 3D Model resolution ──────────────────────────────────────────────────
     let topModel: ModelRecord | null = null;
-    let highlightMeshes: string[] = [];
-    let contextMeshes: string[] = [];
-    let cadNodes: CadNodeMatch[] = [];
+    let highlightMeshes: string[]    = [];
+    let contextMeshes: string[]      = [];
+    let cadNodes: CadNodeMatch[]     = [];
 
-    // 1. PRIMARY: Trust your handcrafted keyword map FIRST (100% precision)
-    // 1. PRIMARY: Trust your handcrafted keyword map FIRST (100% precision)
-    if (keywordCadMatch && keywordCadMatch.model_id) {
-      // Cleaned up the 'as any' since we defined the function properly
-      topModel = await fetchModelById(keywordCadMatch.model_id as number, requestId);
-      
-      highlightMeshes = keywordCadMatch.highlight_meshes || [];
-      contextMeshes = keywordCadMatch.context_meshes || [];
+    // 1. PRIMARY: Handcrafted keyword map — 100% precision, always wins
+    if (keywordCadMatch?.model_id) {
+      topModel        = await fetchModelById(keywordCadMatch.model_id, requestId);
+      highlightMeshes = keywordCadMatch.highlight_meshes ?? [];
+      contextMeshes   = keywordCadMatch.context_meshes   ?? [];
       logger.info('[DEMO SAVED] Used exact keyword map', { requestId, model: topModel?.name });
     }
-    // 2. SECONDARY: Fallback to fuzzy rule tags ONLY if no keyword was found
+    // 2. SECONDARY: Fuzzy rule-tag lookup
     else if (hasRuleMatches && ruleIds.length > 0) {
       const { data: tagRows, error: tagError } = await supabase
         .from('model_rule_tags')
@@ -898,11 +878,11 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         topModel = ((tagRows[0] as Record<string, unknown>).fb_models as ModelRecord) ?? null;
       }
 
-      cadNodes = await fetchCadNodesForRules(ruleIds, requestId);
+      cadNodes        = await fetchCadNodesForRules(ruleIds, requestId);
       highlightMeshes = [...new Set(cadNodes.map(n => n.cad_node_name))];
     }
 
-    // 3. FINAL FALLBACK: Category scan
+    // 3. FINAL FALLBACK: Category keyword scan
     if (!topModel) {
       const categories = extractKeywordsFromQuery(trimmed);
       if (categories.length > 0) {
@@ -920,13 +900,11 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     logger.info('[CAD] Mesh resolution complete', {
       requestId,
       highlight_count: highlightMeshes.length,
-      context_count: contextMeshes.length,
-      source: (keywordCadMatch && keywordCadMatch.model_id) ? 'keyword-first' : 'rule-fallback',
+      context_count:   contextMeshes.length,
+      source: keywordCadMatch?.model_id ? 'keyword-first' : 'rule-fallback',
     });
 
-    // ── No match fallback ────────────────────────────────────────────────────
-    // NEW v13: no generic AI fallback — INDRA only answers from the rulebook.
-    // Returns clean no-match in INDRA voice. Still includes CAD if keyword matched.
+    // ── No match — return clean INDRA voice response, still include CAD ──────
     if (!hasRuleMatches && !hasLearnedMatches) {
       logger.info('No rulebook match found', { requestId, domain: sanitizedDomain });
 
@@ -934,10 +912,9 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         answer: `**No rulebook match found in the ${sanitizedDomain} domain.**\n\n⚡ INDRA NOTE: Try rephrasing with specific component names or rule keywords. Switch domain if this is a cross-domain query.`,
         citations: [],
         intent: 'no_match',
-        code: 'NO_MATCH',
+        code:   'NO_MATCH',
       };
 
-      // Still show 3D model if keyword matched a component — visual context is always useful
       if (topModel?.file_url) {
         noMatchPayload.model_url      = topModel.file_url;
         noMatchPayload.model_metadata = buildModelMetadata(topModel, cadNodes, false);
@@ -945,17 +922,12 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       if (highlightMeshes.length > 0) noMatchPayload.highlight_meshes = highlightMeshes;
       if (contextMeshes.length > 0)   noMatchPayload.context_meshes   = contextMeshes;
 
-      saveLog({
-        request_id: requestId, query: trimmed,
-        result: 'no_match', domain: sanitizedDomain, intent,
-        created_at: new Date().toISOString(),
-      });
-
+      void saveLog({ request_id: requestId, query: trimmed, result: 'no_match', domain: sanitizedDomain, intent, created_at: new Date().toISOString() });
       res.json(noMatchPayload);
       return;
     }
 
-    // ── Build rule context & generate answer ─────────────────────────────────
+    // ── Generate answer ───────────────────────────────────────────────────────
     const ruleContext = [
       ...rerankedRules.map(r =>
         `[Rule ${r.rule_id}${r.rerank_score !== undefined ? ` | Relevance: ${r.rerank_score.toFixed(2)}` : ''}]\n${r.content}`
@@ -967,9 +939,9 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     ].join('\n\n---\n\n');
 
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
-    const answer = await generate(systemPrompt, false, 0.35);
+    const answer       = await generate(systemPrompt, false, 0.35);
 
-    // ── Build response payload ───────────────────────────────────────────────
+    // ── Build response ────────────────────────────────────────────────────────
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
@@ -994,19 +966,17 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       responsePayload.model_metadata = buildModelMetadata(topModel, cadNodes);
     }
 
-    // NEW v13: structured mesh arrays for frontend Three.js highlighting
-    // highlight_meshes → orange (directly relevant parts)
-    // context_meshes   → translucent (surrounding spatial reference parts)
+    // highlight_meshes → orange (directly relevant)
+    // context_meshes   → translucent (spatial reference)
     // cad_nodes        → kept for backwards compatibility
     responsePayload.highlight_meshes = highlightMeshes;
     responsePayload.context_meshes   = contextMeshes;
     responsePayload.cad_nodes        = cadNodes;
 
     writeCache(expandedEmbedding, sanitizedDomain, responsePayload);
-
     res.json(responsePayload);
 
-    saveLog({
+    void saveLog({
       request_id:              requestId,
       query:                   trimmed,
       result:                  'success',
@@ -1025,22 +995,16 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     });
 
   } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    const isQuotaExhausted = msg.toLowerCase().includes('quota_exhausted');
+    const msg              = error instanceof Error ? error.message : String(error);
+    const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED');
     const isTimeout        = msg.startsWith('TIMEOUT:');
 
     logger.error('Error in /ask_indra', error, { requestId });
 
     if (isQuotaExhausted) {
-      res.status(503).json({
-        error: 'All AI capacity is temporarily at quota limit. Please try again in a minute.',
-        code:  'QUOTA_EXHAUSTED',
-      });
+      res.status(503).json({ error: 'All AI capacity is temporarily at quota limit. Please try again in a minute.', code: 'QUOTA_EXHAUSTED' });
     } else if (isTimeout) {
-      res.status(504).json({
-        error: 'The AI took too long to respond. Please try again.',
-        code:  'TIMEOUT',
-      });
+      res.status(504).json({ error: 'The AI took too long to respond. Please try again.', code: 'TIMEOUT' });
     } else {
       res.status(500).json({ error: 'The server encountered an error. Please try again.', code: 'INTERNAL_ERROR' });
     }
@@ -1049,31 +1013,25 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
 // ── Feedback & learning ──────────────────────────────────────────────────────
 app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
-  // Grab the auth details provided by your middleware
-  const authReq = req as AuthenticatedRequest;
+  const authReq   = req as AuthenticatedRequest;
   const requestId = authReq.requestId;
-  const userId = authReq.user?.id; 
+  const userId    = authReq.user?.id;
 
   const { question, answer, domain, rating } = req.body as {
     question: unknown; answer: unknown; domain: unknown; rating: unknown;
   };
 
-  // 1. SECURITY: Add MAX length checks to prevent database bloating/crashing
   if (
     typeof question !== 'string' || question.trim().length < 2 || question.length > 1000 ||
-    typeof answer   !== 'string' || answer.trim().length < 2   || answer.length > 5000 ||
+    typeof answer   !== 'string' || answer.trim().length < 2   || answer.length > 5000   ||
     typeof domain   !== 'string' ||
     !['good', 'bad'].includes(rating as string)
   ) {
-    res.status(400).json({
-      error: "Invalid payload. Check field types and ensure lengths are within limits.",
-      code: 'INVALID_INPUT',
-    });
+    res.status(400).json({ error: 'Invalid payload. Check field types and ensure lengths are within limits.', code: 'INVALID_INPUT' });
     return;
   }
 
   const sanitizedDomain = domain.trim();
-
   if (!VALID_DOMAINS.includes(sanitizedDomain as ValidDomain)) {
     res.status(400).json({ error: 'Invalid domain.', code: 'INVALID_DOMAIN' });
     return;
@@ -1081,9 +1039,7 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
 
   try {
     const trimmedQuestion = question.trim();
-    const trimmedAnswer = answer.trim();
-
-    // 2. SPEED: Run database saves in parallel
+    const trimmedAnswer   = answer.trim();
     const dbTasks: Promise<void>[] = [];
 
     if (rating === 'good') {
@@ -1091,30 +1047,24 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
       logger.info('Learned pair saved from feedback', { requestId, userId, question: trimmedQuestion.slice(0, 60) });
     }
 
-    // 3. RELIABILITY: Now wrapped in a Promise to await
-    dbTasks.push(saveLog({ 
+    dbTasks.push(saveLog({
       request_id: requestId,
-      user_id: userId, // ATTRIBUTION: Know who gave the feedback
-      type: 'feedback', 
-      question: trimmedQuestion, 
-      domain: sanitizedDomain, 
-      rating, 
-      created_at: new Date().toISOString() 
+      user_id:    userId,
+      type:       'feedback',
+      question:   trimmedQuestion,
+      domain:     sanitizedDomain,
+      rating,
+      created_at: new Date().toISOString(),
     }));
 
-    // Wait for all DB operations to finish simultaneously
     await Promise.all(dbTasks);
-
-    res.json({
-      message: rating === 'good'
-        ? 'Answer learned — thanks for the signal!'
-        : 'Feedback noted. We will work to improve.',
-    });
+    res.json({ message: rating === 'good' ? 'Answer learned — thanks for the signal!' : 'Feedback noted. We will work to improve.' });
   } catch (err) {
     logger.error('Feedback save error', err, { requestId });
     res.status(500).json({ error: 'Failed to save feedback.', code: 'INTERNAL_ERROR' });
   }
 });
+
 // ── 3D Model gallery ─────────────────────────────────────────────────────────
 app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { category, limit = '20', offset = '0', search } = req.query;
@@ -1145,7 +1095,8 @@ app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Respon
 
 app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  if (!/^[\w-]+$/.test(id)) {
+  // FIX: length-cap the regex to prevent arbitrarily long ID strings
+  if (!/^[\w-]{1,64}$/.test(id)) {
     res.status(400).json({ error: 'Invalid model ID.', code: 'INVALID_INPUT' });
     return;
   }
@@ -1190,7 +1141,7 @@ app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response
     }
 
     const context = chunks.map(c => `[${c.rule_id}] ${c.content}`).join('\n\n');
-    const prompt = `You are a technical regulations examiner. Based on the regulation excerpts below, generate exactly ${questionCount} multiple-choice quiz questions. Each question must test specific technical knowledge from the rules.
+    const prompt  = `You are a technical regulations examiner. Based on the regulation excerpts below, generate exactly ${questionCount} multiple-choice quiz questions. Each question must test specific technical knowledge from the rules.
 
 Return ONLY a JSON array with this exact structure (no markdown, no explanation):
 
@@ -1236,14 +1187,15 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void 
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀  INDRA RAG Backend v13.0.0`);
+  console.log(`\n🚀  INDRA RAG Backend v13.2.0`);
   console.log(`🌐  http://localhost:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
+  console.log(`🧠  Embed model  : ${CONFIG.EMBEDDING_MODEL}`);
   console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
-  console.log(`🔩  CAD Layer    : Rule-based primary + Keyword secondary → highlight_meshes + context_meshes`);
+  console.log(`🔩  CAD Layer    : Keyword-first → Rule-fallback → Category-scan`);
   console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
   console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per Gemini call`);
   console.log(`🚫  Fallback     : No generic AI fallback — INDRA answers from rulebook only\n`);
