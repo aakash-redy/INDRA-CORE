@@ -930,7 +930,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     // ── Generate answer ───────────────────────────────────────────────────────
     const ruleContext = [
       ...rerankedRules.map(r =>
-        `[Rule ${r.rule_id}${r.rerank_score !== undefined ? ` | Relevance: ${r.rerank_score.toFixed(2)}` : ''}]\n${r.content}`
+        `[Rule ${r.rule_id}${typeof r.rerank_score === 'number' ? ` | Relevance: ${r.rerank_score.toFixed(2)}` : ''}]\n${r.content}`
       ),
       ...(hasLearnedMatches
         ? ['\n--- PREVIOUSLY VERIFIED ANSWERS (high confidence) ---',
