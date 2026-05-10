@@ -451,25 +451,28 @@ Example for 3 chunks: [0.95, 0.3, 0.87]
 No explanation. No markdown. Pure JSON array only.`;
 
   try {
+    // FIX: pass rerankRoster directly — never falls back to primaryRoster
     const raw     = await generateWithRoster(prompt, rerankRoster, true, 0.1);
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const scores: number[] = JSON.parse(cleaned);
 
     if (!Array.isArray(scores) || scores.length !== chunks.length) {
-      throw new Error(`Score array length mismatch: got ${scores.length}, expected ${chunks.length}`);
+      throw new Error(`Score array mismatch: got ${scores.length}, expected ${chunks.length}`);
     }
 
     return chunks
       .map((c, i) => ({ ...c, rerank_score: typeof scores[i] === 'number' ? scores[i] : c.similarity }))
       .sort((a, b) => (b.rerank_score ?? 0) - (a.rerank_score ?? 0));
+
   } catch (err) {
+    // FIX: if reranker fails for ANY reason (quota or otherwise), 
+    // just fall back to cosine order silently — don't throw, don't touch primaryRoster
     logger.warn('[RERANKER] Failed — falling back to cosine order.', { error: String(err) });
     return chunks
       .sort((a, b) => b.similarity - a.similarity)
       .map(c => ({ ...c, rerank_score: c.similarity }));
   }
 }
-
 // ============================================================================
 // ── 9. PROMPT INJECTION GUARD
 // ============================================================================
@@ -825,7 +828,9 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
 
     // All three run in parallel — keyword CAD lookup costs zero extra latency
-    const [learnedMatches, rerankedRules, keywordCadMatch] = await Promise.all([
+    // DB-only calls run in parallel (no API quota used)
+    // Rerank runs sequentially after — uses RERANK key only, never touches PRIMARY
+    const [learnedMatches, keywordCadMatch] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
         try {
           const { data } = await supabase.rpc('match_learned_chunks', {
@@ -839,11 +844,13 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
           return [];
         }
       })(),
-      matchedRules && (matchedRules as RuleChunk[]).length > 1
-        ? rerankChunks(trimmed, matchedRules as RuleChunk[])
-        : Promise.resolve((matchedRules ?? []) as RuleChunk[]),
       fetchCadByKeyword(trimmed, requestId),
     ]);
+
+    // Rerank sequential — RERANK key isolated, PRIMARY key free for generation
+    const rerankedRules: RuleChunk[] = matchedRules && (matchedRules as RuleChunk[]).length > 1
+      ? await rerankChunks(trimmed, matchedRules as RuleChunk[])
+      : (matchedRules ?? []) as RuleChunk[];
 
     const hasRuleMatches    = rerankedRules.length > 0;
     const hasLearnedMatches = learnedMatches.length > 0;
