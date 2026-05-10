@@ -1202,16 +1202,15 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void 
   res.status(500).json({ error: 'Something went wrong. Please try again.', code: 'INTERNAL_ERROR' });
 });
 
-app.listen(PORT, () => {
-  console.log(`\n🚀  INDRA RAG Backend v13.2.0`);
-  console.log(`🌐  http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🚀  INDRA RAG Backend v13.0.0`);
+  console.log(`🌐  http://0.0.0.0:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
-  console.log(`🧠  Embed model  : ${CONFIG.EMBEDDING_MODEL}`);
   console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
-  console.log(`🔩  CAD Layer    : Keyword-first → Rule-fallback → Category-scan`);
+  console.log(`🔩  CAD Layer    : Rule-based primary + Keyword secondary → highlight_meshes + context_meshes`);
   console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
   console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per Gemini call`);
   console.log(`🚫  Fallback     : No generic AI fallback — INDRA answers from rulebook only\n`);
