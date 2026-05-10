@@ -19,6 +19,7 @@ const requiredEnvVars = [
   'SUPABASE_ANON_KEY',
   'GEMINI_API_KEY',
   'GEMINI_RERANK_API_KEY',
+  'GEMINI_EMBEDDING_KEY', // FIX 1 & 4: Dedicated embedding key requirement
   'API_AUTH_TOKEN',
 ];
 
@@ -52,8 +53,6 @@ const CONFIG = {
   RATE_LIMIT_MAX: IS_PROD ? 15 : 50,
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
-  // FIX: This MUST be a real embedding model — NOT a generation model.
-  // 'models/gemini-2.0-flash-lite' is a generation model and will ALWAYS fail for embedContent.
   EMBEDDING_MODEL: 'models/gemini-embedding-001',
   MODEL_COOLDOWN_MS: 60 * 1000,
   GEMINI_TIMEOUT_MS: 25_000,
@@ -94,6 +93,9 @@ function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
 
 const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!, 'PRIMARY');
 const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
+
+// FIX 1: Dedicated Embedding Client initialized with the 3rd environment variable
+const dedicatedEmbeddingClient = new GoogleGenerativeAI(process.env.GEMINI_EMBEDDING_KEY!);
 
 function activeSlots(roster: ModelSlot[]): ModelSlot[] {
   const now = Date.now();
@@ -216,7 +218,11 @@ function writeCache(embedding: number[], domain: string, response: Record<string
     if (oldestKey) semanticCache.delete(oldestKey);
     logger.info(`Cache eviction: max entries (${CONFIG.CACHE_MAX_ENTRIES}) reached.`);
   }
-  const key = `${domain}:${crypto.randomUUID()}`;
+  
+  // FIX 2: Cache Key Bug resolved by hashing the embedding payload
+  const hash = crypto.createHash('md5').update(JSON.stringify(embedding)).digest('hex');
+  const key = `${domain}:${hash}`;
+  
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
 }
 
@@ -280,9 +286,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   return Promise.race([promise, timeout]);
 }
 
-// The roster rotates automatically: each slot is tried in order.
-// If a slot hits quota (429 / resource_exhausted), it gets cooled for 60s
-// and the next slot in the roster is tried immediately.
 async function generateWithRoster(
   prompt: string,
   roster: ModelSlot[],
@@ -315,10 +318,10 @@ async function generateWithRoster(
         continue;
       }
       if (isSkippableError(error)) {
-        coolSlot(slot); // mark this slot cooling, loop continues to next
+        coolSlot(slot); 
         continue;
       }
-      throw error; // hard error — don't swallow it
+      throw error; 
     }
   }
   throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota. Try again shortly.');
@@ -343,87 +346,52 @@ async function generate(
 
 // ============================================================================
 // ── 7. EMBEDDINGS
-// ── FIX: Removed the double `async function embedText(async function embedText(`
-// ── syntax error, fixed the wrong model name ('gemini-embedding-2-flash' does
-// ── not exist), and properly wired roster-aware slot rotation with cooldowns.
 // ============================================================================
 
 async function embedText(
   text: string,
   taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT',
 ): Promise<number[]> {
-  // Use the same roster rotation pattern as generateWithRoster so quota hits
-  // on the embedding model automatically cool the slot and try the next one.
-  // Note: all slots share the same underlying API key, so we use primaryRoster[0]
-  // for the client but honour slot cooldowns to respect per-slot rate limiting.
-  const slots = activeSlots(primaryRoster);
+  try {
+    const embeddingModel = dedicatedEmbeddingClient.getGenerativeModel({
+      model: CONFIG.EMBEDDING_MODEL,
+    });
 
-  for (const slot of slots) {
-    try {
-      // EMBEDDING_MODEL is 'models/gemini-embedding-001' — a real embedding model.
-      // Never use a generation model (gemini-2.0-flash-lite etc.) here; they will
-      // always throw "not supported for embedContent" which isSkippableError catches,
-      // causing every slot to cool and returning a useless zero vector.
-      const embeddingModel = slot.client.getGenerativeModel({
-        model: CONFIG.EMBEDDING_MODEL,
-      });
+    const result = await withTimeout(
+      embeddingModel.embedContent({
+        content: { parts: [{ text }], role: 'user' },
+        taskType: taskType as never,
+        outputDimensionality: 768,
+      } as never),
+      CONFIG.GEMINI_TIMEOUT_MS,
+      'EMBED_DEDICATED',
+    );
 
-      const result = await withTimeout(
-        embeddingModel.embedContent({
-          content: { parts: [{ text }], role: 'user' },
-          taskType: taskType as never,
-          outputDimensionality: 768,
-        } as never),
-        CONFIG.GEMINI_TIMEOUT_MS,
-        `${slot.label}/embed`,
-      );
+    let embedding = result.embedding.values;
 
-      let embedding = result.embedding.values;
+    if (embedding.length > 768) embedding = embedding.slice(0, 768);
 
-      // Safety: trim to 768 dims to match the Supabase vector column schema
-      if (embedding.length > 768) embedding = embedding.slice(0, 768);
+    logger.info(`[EMBED] Dedicated client ✓ (dims: ${embedding.length})`);
+    return embedding;
 
-      slot.successCount++;
-      logger.info(`[EMBED] ${slot.label} ✓ (dims: ${embedding.length})`);
-      return embedding;
-
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-
-      if (msg.startsWith('TIMEOUT:')) {
-        logger.warn(`[EMBED] ${slot.label} timed out — trying next slot.`);
-        continue;
-      }
-
-      if (isSkippableError(err)) {
-        coolSlot(slot);
-        continue;
-      }
-
-      // Hard error (auth, bad request, etc.) — surface it immediately
-      logger.error(`[EMBED] Hard error on ${slot.label}`, err);
-      throw err;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`[EMBED] Dedicated client failed`, err);
+    
+    if (msg.startsWith('TIMEOUT:')) {
+      throw new Error('EMBED_TIMEOUT: Embedding timed out. Try again.');
     }
+    throw new Error('EMBED_EXHAUSTED: Embedding failed or capacity reached.');
   }
-
-  // True last resort: all slots are quota-exhausted. Return zero vector so the
-  // request can still return a graceful no-match rather than a 500 crash.
-  // The zero vector will produce no cosine similarity matches, which is correct
-  // behaviour — we just won't find any rule chunks this cycle.
-  logger.error('[EMBED] All slots exhausted. Returning zero vector — expect no rule matches.', new Error('EMBED_EXHAUSTED'));
-  return new Array(768).fill(0);
 }
 
 const embedQuery    = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
 const embedDocument = (text: string) => embedText(text, 'RETRIEVAL_DOCUMENT');
 
-// Kept as a named wrapper so we can later plug in HyDE / multi-query expansion
-// without changing call sites.
 async function expandAndAverageEmbedding(query: string): Promise<number[]> {
   return embedQuery(query);
 }
 
-// Suppress "declared but never used" — embedDocument is exported for ingestion scripts
 void embedDocument;
 
 // ============================================================================
@@ -451,7 +419,6 @@ Example for 3 chunks: [0.95, 0.3, 0.87]
 No explanation. No markdown. Pure JSON array only.`;
 
   try {
-    // FIX: pass rerankRoster directly — never falls back to primaryRoster
     const raw     = await generateWithRoster(prompt, rerankRoster, true, 0.1);
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const scores: number[] = JSON.parse(cleaned);
@@ -465,8 +432,6 @@ No explanation. No markdown. Pure JSON array only.`;
       .sort((a, b) => (b.rerank_score ?? 0) - (a.rerank_score ?? 0));
 
   } catch (err) {
-    // FIX: if reranker fails for ANY reason (quota or otherwise), 
-    // just fall back to cosine order silently — don't throw, don't touch primaryRoster
     logger.warn('[RERANKER] Failed — falling back to cosine order.', { error: String(err) });
     return chunks
       .sort((a, b) => b.similarity - a.similarity)
@@ -568,7 +533,6 @@ function buildModelMetadata(
   };
 }
 
-// ── FIX: fetchModelById was called in v13 but never defined — added here ──────
 async function fetchModelById(
   modelId: number,
   requestId: string,
@@ -591,7 +555,6 @@ async function fetchModelById(
   }
 }
 
-// ── Rule-based CAD node lookup ────────────────────────────────────────────────
 async function fetchCadNodesForRules(
   ruleIds: string[],
   requestId: string,
@@ -607,7 +570,6 @@ async function fetchCadNodesForRules(
   }
 }
 
-// ── Keyword-based CAD lookup (secondary shield) ───────────────────────────────
 async function fetchCadByKeyword(
   query: string,
   requestId: string,
@@ -621,7 +583,6 @@ async function fetchCadByKeyword(
 
     const lowerQuery = query.toLowerCase();
 
-    // Longest-match first: "front bulkhead" before "bulkhead"
     const match = data
       .sort((a, b) => b.keyword.length - a.keyword.length)
       .find(row => lowerQuery.includes(row.keyword.toLowerCase()));
@@ -634,7 +595,6 @@ async function fetchCadByKeyword(
       context_meshes:   match.context_meshes,
     };
   } catch (err) {
-    // FIX: was silently swallowing errors with no log — now logged
     logger.error('fetchCadByKeyword threw', err, { requestId });
     return null;
   }
@@ -811,11 +771,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     const intent            = classifyIntent(trimmed);
     const expandedEmbedding = await expandAndAverageEmbedding(trimmed);
     logger.info('Query processed', { requestId, intent, domain: sanitizedDomain });
-    logger.info('Embedding complete', {
-  requestId,
-  is_zero_vector: expandedEmbedding.every(v => v === 0),
-  dims: expandedEmbedding.length,
-});
+
     const cacheHit = findCacheHit(expandedEmbedding, sanitizedDomain);
     if (cacheHit) {
       logger.info('Cache hit', { requestId });
@@ -831,9 +787,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     });
     if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
 
-    // All three run in parallel — keyword CAD lookup costs zero extra latency
-    // DB-only calls run in parallel (no API quota used)
-    // Rerank runs sequentially after — uses RERANK key only, never touches PRIMARY
     const [learnedMatches, keywordCadMatch] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
         try {
@@ -851,7 +804,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       fetchCadByKeyword(trimmed, requestId),
     ]);
 
-    // Rerank sequential — RERANK key isolated, PRIMARY key free for generation
     const rerankedRules: RuleChunk[] = matchedRules && (matchedRules as RuleChunk[]).length > 1
       ? await rerankChunks(trimmed, matchedRules as RuleChunk[])
       : (matchedRules ?? []) as RuleChunk[];
@@ -868,14 +820,12 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     let contextMeshes: string[]      = [];
     let cadNodes: CadNodeMatch[]     = [];
 
-    // 1. PRIMARY: Handcrafted keyword map — 100% precision, always wins
     if (keywordCadMatch?.model_id) {
       topModel        = await fetchModelById(keywordCadMatch.model_id, requestId);
       highlightMeshes = keywordCadMatch.highlight_meshes ?? [];
       contextMeshes   = keywordCadMatch.context_meshes   ?? [];
       logger.info('[DEMO SAVED] Used exact keyword map', { requestId, model: topModel?.name });
     }
-    // 2. SECONDARY: Fuzzy rule-tag lookup
     else if (hasRuleMatches && ruleIds.length > 0) {
       const { data: tagRows, error: tagError } = await supabase
         .from('model_rule_tags')
@@ -893,7 +843,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       highlightMeshes = [...new Set(cadNodes.map(n => n.cad_node_name))];
     }
 
-    // 3. FINAL FALLBACK: Category keyword scan
     if (!topModel) {
       const categories = extractKeywordsFromQuery(trimmed);
       if (categories.length > 0) {
@@ -915,7 +864,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       source: keywordCadMatch?.model_id ? 'keyword-first' : 'rule-fallback',
     });
 
-    // ── No match — return clean INDRA voice response, still include CAD ──────
     if (!hasRuleMatches && !hasLearnedMatches) {
       logger.info('No rulebook match found', { requestId, domain: sanitizedDomain });
 
@@ -950,11 +898,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     ].join('\n\n---\n\n');
 
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
-    logger.info('Starting generation', {
-  requestId,
-  primary_slots: primaryRoster.map(s => ({ label: s.label, quotaHits: s.quotaHits, cooling: s.coolUntil > Date.now() })),
-  rerank_slots:  rerankRoster.map(s => ({ label: s.label, quotaHits: s.quotaHits, cooling: s.coolUntil > Date.now() })),
-});
     const answer       = await generate(systemPrompt, false, 0.35);
 
     // ── Build response ────────────────────────────────────────────────────────
@@ -982,9 +925,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       responsePayload.model_metadata = buildModelMetadata(topModel, cadNodes);
     }
 
-    // highlight_meshes → orange (directly relevant)
-    // context_meshes   → translucent (spatial reference)
-    // cad_nodes        → kept for backwards compatibility
     responsePayload.highlight_meshes = highlightMeshes;
     responsePayload.context_meshes   = contextMeshes;
     responsePayload.cad_nodes        = cadNodes;
@@ -1010,14 +950,18 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       created_at:              new Date().toISOString(),
     });
 
-  } catch (error: unknown) {
+ } catch (error: unknown) {
     const msg              = error instanceof Error ? error.message : String(error);
     const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED');
-    const isTimeout        = msg.startsWith('TIMEOUT:');
+    const isEmbedExhausted = msg.includes('EMBED_EXHAUSTED'); 
+    // Ensure both generation timeouts and embedding timeouts are caught here
+    const isTimeout        = msg.startsWith('TIMEOUT:') || msg.includes('EMBED_TIMEOUT');
 
     logger.error('Error in /ask_indra', error, { requestId });
 
-    if (isQuotaExhausted) {
+    if (isEmbedExhausted) {
+      res.status(503).json({ error: 'Service temporarily unavailable — please try again in a moment.', code: 'EMBED_EXHAUSTED' });
+    } else if (isQuotaExhausted) {
       res.status(503).json({ error: 'All AI capacity is temporarily at quota limit. Please try again in a minute.', code: 'QUOTA_EXHAUSTED' });
     } else if (isTimeout) {
       res.status(504).json({ error: 'The AI took too long to respond. Please try again.', code: 'TIMEOUT' });
@@ -1111,7 +1055,6 @@ app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Respon
 
 app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  // FIX: length-cap the regex to prevent arbitrarily long ID strings
   if (!/^[\w-]{1,64}$/.test(id)) {
     res.status(400).json({ error: 'Invalid model ID.', code: 'INVALID_INPUT' });
     return;
@@ -1202,15 +1145,16 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void 
   res.status(500).json({ error: 'Something went wrong. Please try again.', code: 'INTERNAL_ERROR' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀  INDRA RAG Backend v13.0.0`);
-  console.log(`🌐  http://0.0.0.0:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`\n🚀  INDRA RAG Backend v13.2.0`);
+  console.log(`🌐  http://localhost:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
+  console.log(`🧠  Embed model  : ${CONFIG.EMBEDDING_MODEL}`);
   console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
-  console.log(`🔩  CAD Layer    : Rule-based primary + Keyword secondary → highlight_meshes + context_meshes`);
+  console.log(`🔩  CAD Layer    : Keyword-first → Rule-fallback → Category-scan`);
   console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
   console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per Gemini call`);
   console.log(`🚫  Fallback     : No generic AI fallback — INDRA answers from rulebook only\n`);
