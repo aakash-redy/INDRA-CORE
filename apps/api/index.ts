@@ -811,7 +811,11 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     const intent            = classifyIntent(trimmed);
     const expandedEmbedding = await expandAndAverageEmbedding(trimmed);
     logger.info('Query processed', { requestId, intent, domain: sanitizedDomain });
-
+    logger.info('Embedding complete', {
+  requestId,
+  is_zero_vector: expandedEmbedding.every(v => v === 0),
+  dims: expandedEmbedding.length,
+});
     const cacheHit = findCacheHit(expandedEmbedding, sanitizedDomain);
     if (cacheHit) {
       logger.info('Cache hit', { requestId });
@@ -946,6 +950,11 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     ].join('\n\n---\n\n');
 
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
+    logger.info('Starting generation', {
+  requestId,
+  primary_slots: primaryRoster.map(s => ({ label: s.label, quotaHits: s.quotaHits, cooling: s.coolUntil > Date.now() })),
+  rerank_slots:  rerankRoster.map(s => ({ label: s.label, quotaHits: s.quotaHits, cooling: s.coolUntil > Date.now() })),
+});
     const answer       = await generate(systemPrompt, false, 0.35);
 
     // ── Build response ────────────────────────────────────────────────────────
