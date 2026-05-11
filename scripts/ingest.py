@@ -1,13 +1,15 @@
 # ==========================================
-# HEXAWATTS SORA - ULTIMATE INGESTION ENGINE (v7.0)
+# INDRA - INGESTION ENGINE v8.0
 # ==========================================
-# Changes from v6.5:
-#   - Fixed multi-line cell continuation bug (i < len(header) + .get() guard)
-#   - sleep(4.5) now ONLY fires after a real API call, not on skips
-#   - Retry loop: quota cooldown no longer eats the retry budget
-#   - Table buffer: page-break markers no longer interrupt active tables
-#   - Rule ID regex unified across all three places it appears
-#   - Minor: year hardened to constant, log messages cleaned up
+# Changes from v7.0:
+#   - Switched embedding model from Gemini to Nomic (nomic-embed-text-v1.5)
+#   - Nomic outputs 768-dim vectors — Supabase schema unchanged
+#   - Gemini API completely removed from ingestion (zero quota usage at ingest)
+#   - NOMIC_API_KEY added to required env vars
+#   - FREE_TIER_SLEEP removed — Nomic free tier is generous, no hard RPM cap
+#   - Retry logic updated for Nomic API error responses
+#   - Task type updated to "search_document" (Nomic convention)
+#   - Everything else unchanged — PDF parsing, table detection, domain taxonomy
 # ==========================================
 
 import os
@@ -15,10 +17,10 @@ import re
 import json
 import time
 import logging
+import requests
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
-import google.generativeai as genai
 from supabase import create_client, Client
 import pypdf
 
@@ -37,28 +39,114 @@ ROOT_DIR   = SCRIPT_DIR.parent
 ENV_PATH   = ROOT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-_required_keys = ["GEMINI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+_required_keys = ["NOMIC_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
 if not all(os.getenv(k) for k in _required_keys):
-    logger.error("❌ FATAL: Missing one or more API keys in .env — check GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY")
+    logger.error(
+        "❌ FATAL: Missing one or more keys in .env\n"
+        "   Required: NOMIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY"
+    )
     exit(1)
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+NOMIC_API_KEY = os.getenv("NOMIC_API_KEY")
+NOMIC_API_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
+NOMIC_MODEL   = "nomic-embed-text-v1.5"
+NOMIC_DIMS    = 768   # matches existing Supabase pgvector column — no schema change needed
+
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 )
 
-RULEBOOK_YEAR   = "2027"
-FREE_TIER_SLEEP = 4.5   # seconds — keeps RPM safely under Gemini free-tier limit (13 RPM)
+RULEBOOK_YEAR    = "2027"
+NOMIC_BATCH_SIZE = 50   # Nomic supports batching — send up to 50 texts per call
+                        # massively faster than one-by-one Gemini calls
 
 # ==========================================
-# 2. SHARED REGEX (single source of truth)
+# 2. NOMIC EMBEDDING FUNCTION
 # ==========================================
-# Matches rule IDs like: T3.2 / EV4.1.3 / A1 / IN2.3
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a batch of texts using Nomic Atlas API.
+    Task type 'search_document' is correct for rulebook content being stored.
+    Returns a list of 768-dim float vectors matching Supabase schema.
+    Retries up to 3 times with exponential backoff on failure.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                NOMIC_API_URL,
+                headers={
+                    "Authorization": f"Bearer {NOMIC_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": NOMIC_MODEL,
+                    "texts": texts,
+                    "task_type": "search_document",
+                    "dimensionality": NOMIC_DIMS,
+                },
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                wait = 60
+                logger.warning(f"⏳ Nomic rate limit hit — cooling down {wait}s…")
+                time.sleep(wait)
+                continue
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Nomic API error {response.status_code}: {response.text[:200]}"
+                )
+
+            data = response.json()
+            embeddings = data.get("embeddings", [])
+
+            if not embeddings or len(embeddings) != len(texts):
+                raise ValueError(
+                    f"Embedding count mismatch: got {len(embeddings)}, expected {len(texts)}"
+                )
+
+            # Validate dimensions
+            if len(embeddings[0]) != NOMIC_DIMS:
+                raise ValueError(
+                    f"Dimension mismatch: got {len(embeddings[0])}, expected {NOMIC_DIMS}"
+                )
+
+            return embeddings
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️  Nomic timeout on attempt {attempt + 1}/{max_retries}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt * 2)
+            else:
+                raise
+
+        except Exception as e:
+            logger.warning(
+                f"⚠️  Embed attempt {attempt + 1}/{max_retries} failed: {str(e)[:120]}"
+            )
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt * 2)
+            else:
+                raise
+
+    raise RuntimeError("embed_texts: all retries exhausted")
+
+
+def embed_single(text: str) -> list[float]:
+    """Convenience wrapper for single text embedding."""
+    return embed_texts([text])[0]
+
+# ==========================================
+# 3. SHARED REGEX (single source of truth)
+# ==========================================
 RULE_ID_RE = re.compile(r'([A-Z]{1,3}\d*\.\d+(?:\.\d+)*)')
 
 # ==========================================
-# 3. DOMAIN & SUBDOMAIN TAXONOMY
+# 4. DOMAIN & SUBDOMAIN TAXONOMY
 # ==========================================
 
 DOMAIN_MAP = {
@@ -71,7 +159,6 @@ DOMAIN_MAP = {
     "D":  "Dynamic_Events",
 }
 
-# Order matters: first match wins.
 SUBDOMAIN_KEYWORDS: list[tuple[list[str], str]] = [
     (["chassis", "frame", "monocoque", "roll hoop", "roll bar",
       "impact attenuator", "sis"],                                          "Chassis"),
@@ -108,12 +195,10 @@ SUBDOMAIN_KEYWORDS: list[tuple[list[str], str]] = [
 ]
 
 def detect_domain(rule_id: str) -> str:
-    """Map rule ID prefix to top-level domain (e.g. 'EV4.1' → 'Electric_Vehicle')."""
     m = re.match(r'^([A-Z]{1,3})', rule_id)
     return DOMAIN_MAP.get(m.group(1), "Unknown") if m else "Unknown"
 
 def detect_subdomain(text: str) -> str:
-    """Keyword-scan rule text for the best-matching subdomain."""
     lower = text.lower()
     for keywords, subdomain in SUBDOMAIN_KEYWORDS:
         if any(kw in lower for kw in keywords):
@@ -121,21 +206,19 @@ def detect_subdomain(text: str) -> str:
     return "General"
 
 # ==========================================
-# 4. TEXT UTILITIES
+# 5. TEXT UTILITIES
 # ==========================================
 
 def sanitize_text(text: str) -> str:
-    """Strip null bytes; collapse horizontal whitespace; preserve newlines for regex."""
     text = text.replace('\x00', '')
     return re.sub(r'[ \t]+', ' ', text).strip()
 
 def format_rule(text: str, max_chars: int = 4000) -> str:
-    """Collapse whitespace; hard-truncate overly long rules."""
     cleaned = " ".join(text.split())
     return cleaned if len(cleaned) <= max_chars else cleaned[:max_chars] + " [TRUNCATED]"
 
 # ==========================================
-# 5. TABLE DETECTION & PARSING
+# 6. TABLE DETECTION & PARSING
 # ==========================================
 
 _TABLE_LINE_RE = re.compile(r'(\|.+\||\t.+\t|(?:\S+\s{2,}){2,}\S+)')
@@ -150,47 +233,28 @@ def _split_row(line: str) -> list[str]:
     return [c.strip() for c in normalised.split('\t') if c.strip()]
 
 def _parse_table_lines(lines: list[str]) -> list[dict]:
-    """
-    Convert raw table lines into a list-of-dicts (JSON-ready).
-    Handles multi-line cell continuation: if a row has fewer columns than
-    the header, its content is appended to the previous row's cells.
-    """
     if not lines:
         return []
-
     header = _split_row(lines[0])
     if not header:
         return []
-
     rows: list[dict] = []
     for line in lines[1:]:
         cols = _split_row(line)
         if not cols:
             continue
-
-        # ✅ FIX: continuation row → append to last row's cells
         if len(cols) < len(header) and rows:
             for i, col_text in enumerate(cols):
-                if i < len(header) and col_text:          # guard: stay within header width
+                if i < len(header) and col_text:
                     key = header[i]
                     rows[-1][key] = f"{rows[-1].get(key, '')} {col_text}".strip()
             continue
-
-        # Normal row: pad or trim to header width
         cols = (cols + [''] * len(header))[:len(header)]
         rows.append(dict(zip(header, cols)))
-
     return rows
 
 
 class TableBuffer:
-    """
-    Two-pass cross-page table stitcher.
-    Feed it every line of the document; it accumulates table lines across
-    page boundaries and flushes only when a non-table line interrupts.
-    Page-break markers are transparent — they never close an active table.
-    """
-
     def __init__(self):
         self._lines: list[str] = []
         self._active           = False
@@ -198,10 +262,8 @@ class TableBuffer:
         self._completed: list[tuple[str, list[dict]]] = []
 
     def feed_line(self, line: str, current_rule_id: str):
-        # Page-break markers must NEVER interrupt an active table
         if line.startswith("__PAGE_BREAK_"):
             return
-
         if _is_table_line(line):
             if not self._active:
                 self._active           = True
@@ -232,7 +294,7 @@ class TableBuffer:
         return result
 
 # ==========================================
-# 6. CORE INGESTION FUNCTION
+# 7. CORE INGESTION FUNCTION
 # ==========================================
 
 def ingest_domain(
@@ -242,7 +304,9 @@ def ingest_domain(
     end_page:      Optional[int] = None,
     force_refresh: bool = False,
 ):
-    logger.info(f"🏁 SYSTEM ONLINE — targeting [{domain}]")
+    logger.info(f"🏁 INDRA INGESTION ENGINE v8.0 — targeting [{domain}]")
+    logger.info(f"🧠 Embedding model : {NOMIC_MODEL} ({NOMIC_DIMS} dims)")
+    logger.info(f"📦 Batch size      : {NOMIC_BATCH_SIZE} rules per API call")
 
     if not file_path.exists():
         logger.error(f"❌ File not found: {file_path}")
@@ -284,9 +348,9 @@ def ingest_domain(
         logger.error(f"❌ PDF extraction failed: {e}")
         return
 
-    # ── STEP 2: TABLE PASS (zero API cost) ──────────────────────────────────
-    table_buffer    = TableBuffer()
-    _cur_rule_id    = "General Context"
+    # ── STEP 2: TABLE PASS ───────────────────────────────────────────────────
+    table_buffer = TableBuffer()
+    _cur_rule_id = "General Context"
 
     for line in all_lines:
         m = RULE_ID_RE.match(line.strip())
@@ -316,15 +380,13 @@ def ingest_domain(
 
     logger.info(f"✂️  Split into ~{len(split_content) // 2} rule chunks.")
 
-    # ── STEP 4: EMBED & UPLOAD ───────────────────────────────────────────────
+    # ── STEP 4: BUILD RULE PAYLOADS ──────────────────────────────────────────
+    # Collect all rules first then batch embed — far more efficient than
+    # one API call per rule like the old Gemini approach
+    pending: list[dict] = []
     current_rule_id = "General Context"
-    uploaded        = 0
-    skipped         = 0
-    tables_attached = 0
 
     for item in split_content:
-
-        # Rule ID header token — just update state, no upload
         if RULE_ID_RE.fullmatch(item):
             current_rule_id = item
             continue
@@ -333,101 +395,120 @@ def ingest_domain(
         if len(rule_text) < 15:
             continue
 
-        # Deduplication
         if current_rule_id in existing_rules:
-            skipped += 1
             continue
 
-        # Tagging
         rule_domain    = detect_domain(current_rule_id)
         rule_subdomain = detect_subdomain(rule_text)
-
-        # Tables
-        associated = tables_by_rule.get(current_rule_id)
-        tables_json = json.dumps(associated) if associated else None
-        if associated:
-            tables_attached += len(associated)
+        associated     = tables_by_rule.get(current_rule_id)
+        tables_json    = json.dumps(associated) if associated else None
 
         enriched = (
             f"[Rule {current_rule_id} | Domain: {rule_domain} | "
             f"Subdomain: {rule_subdomain}] {rule_text}"
         )
 
-        # ── RETRY LOOP ───────────────────────────────────────────────────────
-        max_retries    = 3
-        api_call_made  = False
+        pending.append({
+            "rule_id":       current_rule_id,
+            "content":       enriched,
+            "domain":        rule_domain,
+            "subdomain":     rule_subdomain,
+            "source_domain": domain,
+            "year":          RULEBOOK_YEAR,
+            "tables_json":   tables_json,
+            "associated":    associated,
+        })
 
-        for attempt in range(max_retries):
+    logger.info(f"📋 {len(pending)} rules to embed and upload.")
+
+    if not pending:
+        logger.info("✅ Nothing to do — all rules already in DB.")
+        return
+
+    # ── STEP 5: BATCH EMBED & UPLOAD ─────────────────────────────────────────
+    # NEW v8.0: batch embedding means ~26 API calls for 1300 rules
+    # vs 1300 individual calls in the old Gemini approach
+    uploaded        = 0
+    failed          = 0
+    tables_attached = 0
+
+    for batch_start in range(0, len(pending), NOMIC_BATCH_SIZE):
+        batch = pending[batch_start:batch_start + NOMIC_BATCH_SIZE]
+        texts = [r["content"] for r in batch]
+
+        logger.info(
+            f"🔢 Embedding batch {batch_start // NOMIC_BATCH_SIZE + 1}/"
+            f"{(len(pending) + NOMIC_BATCH_SIZE - 1) // NOMIC_BATCH_SIZE} "
+            f"({len(batch)} rules)…"
+        )
+
+        try:
+            embeddings = embed_texts(texts)
+        except Exception as e:
+            logger.error(f"❌ Batch embed failed: {e} — skipping {len(batch)} rules.")
+            failed += len(batch)
+            continue
+
+        # Upload each rule in the batch with its embedding
+        for rule, embedding in zip(batch, embeddings):
             try:
-                result = genai.embed_content(
-                    model="models/gemini-embedding-001",
-                    content=enriched,
-                    task_type="retrieval_document",
-                    output_dimensionality=768,
-                )
-                api_call_made = True
-
-                payload: dict = {
-                    "content":       enriched,
-                    "rule_id":       current_rule_id,
-                    "domain":        rule_domain,
-                    "subdomain":     rule_subdomain,
-                    "source_domain": domain,
-                    "year":          RULEBOOK_YEAR,
-                    "embedding":     result['embedding'],
+                payload = {
+                    "content":       rule["content"],
+                    "rule_id":       rule["rule_id"],
+                    "domain":        rule["domain"],
+                    "subdomain":     rule["subdomain"],
+                    "source_domain": rule["source_domain"],
+                    "year":          rule["year"],
+                    "embedding":     embedding,
                 }
-                if tables_json:
-                    payload["tables_json"] = tables_json   # JSONB column required
+                if rule["tables_json"]:
+                    payload["tables_json"] = rule["tables_json"]
 
                 supabase.table("rulebook_chunks").insert(payload).execute()
                 uploaded += 1
+
+                if rule["associated"]:
+                    tables_attached += len(rule["associated"])
+
                 logger.info(
-                    f"✅  Rule {current_rule_id} "
-                    f"[{rule_domain} / {rule_subdomain}]"
-                    + (f" + {len(associated)} table(s)" if associated else "")
+                    f"✅  Rule {rule['rule_id']} "
+                    f"[{rule['domain']} / {rule['subdomain']}]"
+                    + (f" + {len(rule['associated'])} table(s)" if rule["associated"] else "")
                 )
-                break  # success — exit retry loop
 
             except Exception as e:
-                err = str(e)
-                logger.warning(
-                    f"⚠️  Attempt {attempt + 1}/{max_retries} failed "
-                    f"for {current_rule_id}: {err[:100]}"
-                )
+                logger.error(f"❌ Upload failed for {rule['rule_id']}: {str(e)[:100]}")
+                failed += 1
 
-                if "429" in err or "quota" in err.lower():
-                    # Quota hit: cool down but DON'T burn a retry slot
-                    logger.info("⏳ Rate limit hit — cooling down 60 s…")
-                    time.sleep(60)
-                    # Reset attempt counter so we get a full 3 retries after cooldown
-                    attempt = -1   # loop will increment to 0
-                elif attempt < max_retries - 1:
-                    time.sleep((2 ** attempt) * 2)   # exponential back-off: 2 s, 4 s
-                else:
-                    logger.error(f"❌ Permanent failure on rule {current_rule_id} — skipping.")
+        # Small pause between batches — polite to the API
+        # No hard sleep needed since Nomic free tier has no strict RPM cap
+        time.sleep(0.5)
 
-        # ── RATE LIMIT GUARD ─────────────────────────────────────────────────
-        # Only sleep when we actually hit the Gemini API (skipped rules cost nothing)
-        if api_call_made:
-            time.sleep(FREE_TIER_SLEEP)
+    skipped = len(existing_rules)
 
     logger.info(
         f"\n🏆 INGESTION COMPLETE — [{domain}]\n"
-        f"   ✅  Uploaded : {uploaded} rules\n"
-        f"   ⏭️  Skipped  : {skipped} rules (already in DB)\n"
-        f"   📊  Tables   : {tables_attached} attached\n"
+        f"   🧠  Model     : {NOMIC_MODEL} ({NOMIC_DIMS} dims)\n"
+        f"   ✅  Uploaded  : {uploaded} rules\n"
+        f"   ❌  Failed    : {failed} rules\n"
+        f"   ⏭️  Skipped   : {skipped} rules (already in DB)\n"
+        f"   📊  Tables    : {tables_attached} attached\n"
+        f"   📦  API calls : ~{(uploaded + failed + NOMIC_BATCH_SIZE - 1) // NOMIC_BATCH_SIZE} "
+        f"(vs {uploaded + failed} with old Gemini approach)\n"
     )
 
 # ==========================================
-# 7. MANUAL CONTROL DECK
+# 8. MANUAL CONTROL DECK
 # ==========================================
 if __name__ == "__main__":
     TARGET_DOMAIN    = "Formula Bharat 2027 Full"
     START_PAGE       = 1
     END_PAGE         = None    # None = entire document
-    WIPE_SLATE_CLEAN = False  # True = delete all existing records first
+    WIPE_SLATE_CLEAN = True    # True = wipe Gemini vectors and reingest with Nomic
 
-    logger.info("🚀 INITIATING FULL RULEBOOK LAUNCH SEQUENCE…")
+    logger.info("🚀 INDRA INGESTION ENGINE v8.0 — NOMIC REINGESTION SEQUENCE…")
+    logger.info("⚠️  WIPE_SLATE_CLEAN=True — existing Gemini vectors will be deleted")
+    logger.info("   This is required because Gemini and Nomic vectors are incompatible")
 
     ingest_domain(
         file_path     = ROOT_DIR / "FB2027_Rules.pdf",

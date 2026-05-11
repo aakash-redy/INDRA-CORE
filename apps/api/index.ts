@@ -19,7 +19,7 @@ const requiredEnvVars = [
   'SUPABASE_ANON_KEY',
   'GEMINI_API_KEY',
   'GEMINI_RERANK_API_KEY',
-  'GEMINI_EMBEDDING_KEY', // FIX 1 & 4: Dedicated embedding key requirement
+  'NOMIC_API_KEY',        // replaces GEMINI_EMBEDDING_KEY
   'API_AUTH_TOKEN',
 ];
 
@@ -53,7 +53,6 @@ const CONFIG = {
   RATE_LIMIT_MAX: IS_PROD ? 15 : 50,
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
-  EMBEDDING_MODEL: 'models/gemini-embedding-001',
   MODEL_COOLDOWN_MS: 60 * 1000,
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
@@ -95,7 +94,7 @@ const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!,
 const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
 
 // FIX 1: Dedicated Embedding Client initialized with the 3rd environment variable
-const dedicatedEmbeddingClient = new GoogleGenerativeAI(process.env.GEMINI_EMBEDDING_KEY!);
+
 
 function activeSlots(roster: ModelSlot[]): ModelSlot[] {
   const now = Date.now();
@@ -345,55 +344,81 @@ async function generate(
 }
 
 // ============================================================================
-// ── 7. EMBEDDINGS
+// ── 7. EMBEDDINGS — Nomic Atlas (nomic-embed-text-v1.5)
+// Zero Gemini quota used for embedding at runtime.
+// 768-dim output matches Supabase pgvector schema exactly.
 // ============================================================================
+
+const NOMIC_EMBED_URL = 'https://api-atlas.nomic.ai/v1/embedding/text';
 
 async function embedText(
   text: string,
-  taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT',
+  taskType: 'search_query' | 'search_document' = 'search_query',
 ): Promise<number[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.GEMINI_TIMEOUT_MS);
+
   try {
-    const embeddingModel = dedicatedEmbeddingClient.getGenerativeModel({
-      model: CONFIG.EMBEDDING_MODEL,
+    const response = await fetch(NOMIC_EMBED_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.NOMIC_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'nomic-embed-text-v1.5',
+        texts: [text],
+        task_type: taskType,
+        dimensionality: 768,
+      }),
+      signal: controller.signal,
     });
 
-    const result = await withTimeout(
-      embeddingModel.embedContent({
-        content: { parts: [{ text }], role: 'user' },
-        taskType: taskType as never,
-        outputDimensionality: 768,
-      } as never),
-      CONFIG.GEMINI_TIMEOUT_MS,
-      'EMBED_DEDICATED',
-    );
+    clearTimeout(timeout);
 
-    let embedding = result.embedding.values;
+    if (response.status === 429) {
+      logger.warn('[EMBED] Nomic rate limit hit — retrying after 10s');
+      await new Promise(r => setTimeout(r, 10_000));
+      return embedText(text, taskType);
+    }
 
-    if (embedding.length > 768) embedding = embedding.slice(0, 768);
+    if (!response.ok) {
+      throw new Error(`Nomic API error ${response.status}: ${await response.text()}`);
+    }
 
-    logger.info(`[EMBED] Dedicated client ✓ (dims: ${embedding.length})`);
+    const data = await response.json() as { embeddings: number[][] };
+    const embedding = data.embeddings?.[0];
+
+    if (!embedding || embedding.length !== 768) {
+      throw new Error(`EMBED_EXHAUSTED: Invalid embedding — got ${embedding?.length ?? 0} dims, expected 768`);
+    }
+
+    logger.info(`[EMBED] Nomic ✓ (dims: ${embedding.length}, task: ${taskType})`);
     return embedding;
 
   } catch (err: unknown) {
+    clearTimeout(timeout);
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error(`[EMBED] Dedicated client failed`, err);
-    
-    if (msg.startsWith('TIMEOUT:')) {
-      throw new Error('EMBED_TIMEOUT: Embedding timed out. Try again.');
+
+    if (msg.includes('aborted') || msg.includes('TIMEOUT')) {
+      throw new Error('EMBED_TIMEOUT: Nomic embedding timed out. Try again.');
     }
-    throw new Error('EMBED_EXHAUSTED: Embedding failed or capacity reached.');
+    if (msg.startsWith('EMBED_')) throw err;
+
+    logger.error('[EMBED] Nomic failed', err);
+    throw new Error('EMBED_EXHAUSTED: Embedding failed. Try again.');
   }
 }
 
-const embedQuery    = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
-const embedDocument = (text: string) => embedText(text, 'RETRIEVAL_DOCUMENT');
+// task_type 'search_query' for runtime queries — matches 'search_document' used at ingestion
+const embedQuery    = (text: string) => embedText(text, 'search_query');
+const embedDocument = (text: string) => embedText(text, 'search_document');
 
 async function expandAndAverageEmbedding(query: string): Promise<number[]> {
   return embedQuery(query);
 }
 
 void embedDocument;
-
 // ============================================================================
 // ── 8. RERANKER — cross-encoder via rerankRoster (token-efficient)
 // ============================================================================
@@ -1152,7 +1177,7 @@ app.listen(PORT, () => {
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
-  console.log(`🧠  Embed model  : ${CONFIG.EMBEDDING_MODEL}`);
+  console.log(`🧠  Embed model  : nomic-embed-text-v1.5 (Nomic Atlas)`);
   console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
   console.log(`🔩  CAD Layer    : Keyword-first → Rule-fallback → Category-scan`);
   console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
