@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
+import Groq from 'groq-sdk';
 import crypto from 'crypto';
 
 dotenv.config();
@@ -19,8 +20,11 @@ const requiredEnvVars = [
   'SUPABASE_ANON_KEY',
   'GEMINI_API_KEY',
   'GEMINI_RERANK_API_KEY',
-  'NOMIC_API_KEY',        // replaces GEMINI_EMBEDDING_KEY
+  'NOMIC_API_KEY',
   'API_AUTH_TOKEN',
+  'GROQ_API_KEY_1',
+  'GROQ_API_KEY_2',
+  'COHERE_API_KEY',
 ];
 
 requiredEnvVars.forEach(v => {
@@ -62,71 +66,7 @@ const CONFIG = {
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
 
 // ============================================================================
-// ── 2. MODEL ROSTER & PER-MODEL CIRCUIT BREAKER
-// ============================================================================
-
-interface ModelSlot {
-  label: string;
-  modelName: string;
-  client: GoogleGenerativeAI;
-  coolUntil: number;
-  quotaHits: number;
-  successCount: number;
-}
-
-function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
-  const client = new GoogleGenerativeAI(apiKey);
-  const models = [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
-  ];
-  return models.map(modelName => ({
-    label: `${keyLabel}/${modelName}`,
-    modelName,
-    client,
-    coolUntil: 0,
-    quotaHits: 0,
-    successCount: 0,
-  }));
-}
-
-const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!, 'PRIMARY');
-const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
-
-// FIX 1: Dedicated Embedding Client initialized with the 3rd environment variable
-
-
-function activeSlots(roster: ModelSlot[]): ModelSlot[] {
-  const now = Date.now();
-  const active = roster.filter(s => s.coolUntil <= now);
-  // If everything is cooling, return all slots so we still try rather than hanging
-  return active.length > 0 ? active : roster;
-}
-
-function coolSlot(slot: ModelSlot): void {
-  slot.quotaHits++;
-  slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
-  logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
-}
-
-function isSkippableError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error);
-  const lower = msg.toLowerCase();
-  return (
-    msg.includes('429')                               ||
-    lower.includes('quota')                           ||
-    lower.includes('resource_exhausted')              ||
-    lower.includes('rate_limit')                      ||
-    msg.includes('404')                               ||
-    lower.includes('not found')                       ||
-    lower.includes('is not supported')                ||
-    lower.includes('not supported for generatecontent')
-  );
-}
-
-// ============================================================================
-// ── 3. TYPES & INTERFACES
+// ── 2. TYPES & INTERFACES
 // ============================================================================
 
 interface CacheEntry {
@@ -183,6 +123,26 @@ interface CadKeywordMatch {
 type QueryIntent = 'dimension' | 'compliance' | 'definition' | 'procedure' | 'general';
 
 // ============================================================================
+// ── 3. MODEL ROSTER INTERFACES
+// ============================================================================
+
+interface ModelSlot {
+  label: string;
+  modelName: string;
+  client: GoogleGenerativeAI;
+  coolUntil: number;
+  quotaHits: number;
+  successCount: number;
+}
+
+interface GroqSlot {
+  label: string;
+  client: Groq;
+  coolUntil: number;
+  quotaHits: number;
+}
+
+// ============================================================================
 // ── 4. IN-MEMORY SEMANTIC CACHE & GARBAGE COLLECTOR
 // ============================================================================
 
@@ -218,11 +178,8 @@ function writeCache(embedding: number[], domain: string, response: Record<string
     if (oldestKey) semanticCache.delete(oldestKey);
     logger.info(`Cache eviction: max entries (${CONFIG.CACHE_MAX_ENTRIES}) reached.`);
   }
-  
-  // FIX 2: Cache Key Bug resolved by hashing the embedding payload
   const hash = crypto.createHash('md5').update(JSON.stringify(embedding)).digest('hex');
   const key = `${domain}:${hash}`;
-  
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
 }
 
@@ -276,14 +233,66 @@ async function saveLearnedPair(
 }
 
 // ============================================================================
-// ── 6. CORE AI ENGINE — TIMEOUT WRAPPER + PER-MODEL ROTATION
+// ── 6. CORE AI ENGINE — TIMEOUT WRAPPER
 // ============================================================================
 
+// withTimeout must be defined FIRST — Groq and Gemini rosters both depend on it
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   const timeout = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error(`TIMEOUT: ${label} exceeded ${ms}ms`)), ms)
   );
   return Promise.race([promise, timeout]);
+}
+
+// ============================================================================
+// ── 7. GEMINI MODEL ROSTER & CIRCUIT BREAKER
+// ============================================================================
+
+function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
+  const client = new GoogleGenerativeAI(apiKey);
+  const models = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+  ];
+  return models.map(modelName => ({
+    label: `${keyLabel}/${modelName}`,
+    modelName,
+    client,
+    coolUntil: 0,
+    quotaHits: 0,
+    successCount: 0,
+  }));
+}
+
+const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!, 'PRIMARY');
+const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
+
+function activeSlots(roster: ModelSlot[]): ModelSlot[] {
+  const now = Date.now();
+  const active = roster.filter(s => s.coolUntil <= now);
+  return active.length > 0 ? active : roster;
+}
+
+function coolSlot(slot: ModelSlot): void {
+  slot.quotaHits++;
+  slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
+  logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
+}
+
+function isSkippableError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  const lower = msg.toLowerCase();
+  return (
+    msg.includes('429')                               ||
+    lower.includes('quota')                           ||
+    lower.includes('resource_exhausted')              ||
+    lower.includes('rate_limit')                      ||
+    msg.includes('404')                               ||
+    lower.includes('not found')                       ||
+    lower.includes('is not supported')                ||
+    lower.includes('not supported for generatecontent')
+  );
 }
 
 async function generateWithRoster(
@@ -318,36 +327,100 @@ async function generateWithRoster(
         continue;
       }
       if (isSkippableError(error)) {
-        coolSlot(slot); 
+        coolSlot(slot);
         continue;
       }
-      throw error; 
+      throw error;
     }
   }
   throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota. Try again shortly.');
 }
+
+// ============================================================================
+// ── 8. GROQ ROSTER — defined AFTER withTimeout
+// ============================================================================
+
+function buildGroqRoster(): GroqSlot[] {
+  return [
+    process.env.GROQ_API_KEY_1,
+    process.env.GROQ_API_KEY_2,
+  ]
+  .filter(Boolean)
+  .map((key, i) => ({
+    label: `GROQ_KEY_${i + 1}`,
+    client: new Groq({ apiKey: key }),
+    coolUntil: 0,
+    quotaHits: 0,
+  }));
+}
+
+const groqRoster = buildGroqRoster();
+
+async function generateWithGroqRoster(prompt: string, temperature = 0.7): Promise<string> {
+  const now = Date.now();
+  const active = groqRoster.filter(s => s.coolUntil <= now);
+  const slots = active.length > 0 ? active : groqRoster;
+
+  for (const slot of slots) {
+    try {
+      const response = await withTimeout(
+        slot.client.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: [{ role: 'user', content: prompt }],
+          temperature,
+        }),
+        CONFIG.GEMINI_TIMEOUT_MS,
+        slot.label,
+      );
+      logger.info(`[GROQ] ${slot.label} ✓`);
+      return response.choices[0]?.message?.content ?? '';
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('429') || msg.includes('rate') || msg.includes('quota')) {
+        slot.quotaHits++;
+        slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
+        logger.warn(`[GROQ] ${slot.label} rate limited — cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('GROQ_EXHAUSTED: All Groq keys are at rate limit.');
+}
+
+// ============================================================================
+// ── 9. UNIFIED GENERATE — Groq → Gemini primary → Gemini rerank key
+// ============================================================================
 
 async function generate(
   prompt: string,
   requireJson = false,
   temperature = 0.7,
 ): Promise<string> {
+  // 1st — Groq Key 1 & 2
+  try {
+    return await generateWithGroqRoster(prompt, temperature);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.startsWith('GROQ_EXHAUSTED')) throw err;
+    logger.warn('[ROSTER] Groq exhausted — falling back to Gemini primary.');
+  }
+
+  // 2nd — Gemini primary key
   try {
     return await generateWithRoster(prompt, primaryRoster, requireJson, temperature);
-  } catch (err: unknown) {
+  } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.startsWith('QUOTA_EXHAUSTED')) {
-      logger.warn('[ROSTER] Primary roster exhausted — falling back to rerank key for generation.');
-      return generateWithRoster(prompt, rerankRoster, requireJson, temperature);
-    }
-    throw err;
+    if (!msg.startsWith('QUOTA_EXHAUSTED')) throw err;
+    logger.warn('[ROSTER] Gemini primary exhausted — falling back to Gemini rerank key.');
   }
+
+  // 3rd — Gemini rerank key as last resort
+  return generateWithRoster(prompt, rerankRoster, requireJson, temperature);
 }
 
 // ============================================================================
-// ── 7. EMBEDDINGS — Nomic Atlas (nomic-embed-text-v1.5)
-// Zero Gemini quota used for embedding at runtime.
-// 768-dim output matches Supabase pgvector schema exactly.
+// ── 10. EMBEDDINGS — Nomic Atlas (nomic-embed-text-v1.5)
 // ============================================================================
 
 const NOMIC_EMBED_URL = 'https://api-atlas.nomic.ai/v1/embedding/text';
@@ -411,7 +484,6 @@ async function embedText(
   }
 }
 
-// task_type 'search_query' for runtime queries — matches 'search_document' used at ingestion
 const embedQuery    = (text: string) => embedText(text, 'search_query');
 const embedDocument = (text: string) => embedText(text, 'search_document');
 
@@ -420,13 +492,47 @@ async function expandAndAverageEmbedding(query: string): Promise<number[]> {
 }
 
 void embedDocument;
+
 // ============================================================================
-// ── 8. RERANKER — cross-encoder via rerankRoster (token-efficient)
+// ── 11. RERANKER — Cohere first, Gemini rerankRoster as fallback
 // ============================================================================
 
 async function rerankChunks(query: string, chunks: RuleChunk[]): Promise<RuleChunk[]> {
   if (chunks.length <= 1) return chunks;
 
+  // 1st — Cohere dedicated reranker (no LLM quota used)
+  try {
+    const response = await fetch('https://api.cohere.com/v2/rerank', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.COHERE_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'rerank-v3.5',
+        query,
+        documents: chunks.map(c => c.content.slice(0, CONFIG.RERANK_CHUNK_PREVIEW)),
+        top_n: chunks.length,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`Cohere error ${response.status}: ${await response.text()}`);
+
+    const data = await response.json() as {
+      results: { index: number; relevance_score: number }[]
+    };
+
+    logger.info('[RERANKER] Cohere ✓');
+    return data.results.map(r => ({
+      ...chunks[r.index],
+      rerank_score: r.relevance_score,
+    }));
+
+  } catch (err) {
+    logger.warn('[RERANKER] Cohere failed — falling back to Gemini reranker.', { error: String(err) });
+  }
+
+  // 2nd — Gemini rerankRoster as fallback
   const chunkList = chunks
     .map((c, i) => `[${i}] Rule ${c.rule_id}: ${c.content.slice(0, CONFIG.RERANK_CHUNK_PREVIEW)}`)
     .join('\n\n');
@@ -453,19 +559,21 @@ No explanation. No markdown. Pure JSON array only.`;
       throw new Error(`Score array mismatch: got ${scores.length}, expected ${chunks.length}`);
     }
 
+    logger.info('[RERANKER] Gemini fallback ✓');
     return chunks
       .map((c, i) => ({ ...c, rerank_score: typeof scores[i] === 'number' ? scores[i] : c.similarity }))
       .sort((a, b) => (b.rerank_score ?? 0) - (a.rerank_score ?? 0));
 
   } catch (err) {
-    logger.warn('[RERANKER] Failed — falling back to cosine order.', { error: String(err) });
+    logger.warn('[RERANKER] Gemini fallback also failed — using cosine order.', { error: String(err) });
     return chunks
       .sort((a, b) => b.similarity - a.similarity)
       .map(c => ({ ...c, rerank_score: c.similarity }));
   }
 }
+
 // ============================================================================
-// ── 9. PROMPT INJECTION GUARD
+// ── 12. PROMPT INJECTION GUARD
 // ============================================================================
 
 const INJECTION_PATTERNS: RegExp[] = [
@@ -486,7 +594,7 @@ function detectInjection(text: string): boolean {
 }
 
 // ============================================================================
-// ── 10. INTENT CLASSIFICATION & PROMPT BUILDING
+// ── 13. INTENT CLASSIFICATION & PROMPT BUILDING
 // ============================================================================
 
 function classifyIntent(query: string): QueryIntent {
@@ -627,7 +735,7 @@ async function fetchCadByKeyword(
 }
 
 // ============================================================================
-// ── 11. MIDDLEWARE
+// ── 14. MIDDLEWARE
 // ============================================================================
 
 async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -700,24 +808,33 @@ app.use(cors({
 }));
 
 // ============================================================================
-// ── 12. ROUTES
+// ── 15. ROUTES
 // ============================================================================
 
 app.get('/health', (_req: Request, res: Response): void => {
   const now = Date.now();
-  const rosterSummary = (roster: ModelSlot[]) => ({
+
+  const geminiRosterSummary = (roster: ModelSlot[]) => ({
     total:   roster.length,
     active:  roster.filter(s => s.coolUntil <= now).length,
     cooling: roster.filter(s => s.coolUntil > now).length,
   });
+
+  const groqRosterSummary = {
+    total:   groqRoster.length,
+    active:  groqRoster.filter(s => s.coolUntil <= now).length,
+    cooling: groqRoster.filter(s => s.coolUntil > now).length,
+  };
+
   res.json({
     status: 'ok',
     service: 'INDRA RAG Backend',
-    version: '13.2.0',
+    version: '14.0.0',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
-    primary_roster: rosterSummary(primaryRoster),
-    rerank_roster:  rosterSummary(rerankRoster),
+    groq_roster:    groqRosterSummary,
+    primary_roster: geminiRosterSummary(primaryRoster),
+    rerank_roster:  geminiRosterSummary(rerankRoster),
   });
 });
 
@@ -727,7 +844,8 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
     return;
   }
   const now = Date.now();
-  const rosterStatus = (roster: ModelSlot[]) =>
+
+  const geminiRosterStatus = (roster: ModelSlot[]) =>
     roster.map(s => ({
       label:        s.label,
       model:        s.modelName,
@@ -736,9 +854,21 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
       quotaHits:    s.quotaHits,
       successCount: s.successCount,
     }));
+
+  const groqRosterStatus = groqRoster.map(s => ({
+    label:     s.label,
+    model:     'llama-3.3-70b-versatile',
+    status:    s.coolUntil > now ? 'cooling' : 'active',
+    coolUntil: s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
+    quotaHits: s.quotaHits,
+  }));
+
   res.json({
-    primary_roster: rosterStatus(primaryRoster),
-    rerank_roster:  rosterStatus(rerankRoster),
+    generation_chain: 'Groq #1 → Groq #2 → Gemini primary → Gemini rerank key',
+    rerank_chain:     'Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity',
+    groq_roster:    groqRosterStatus,
+    primary_roster: geminiRosterStatus(primaryRoster),
+    rerank_roster:  geminiRosterStatus(rerankRoster),
     note: 'Models are tried in order. A cooled model is skipped until its cooldown expires.',
   });
 });
@@ -976,11 +1106,10 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       created_at:              new Date().toISOString(),
     });
 
- } catch (error: unknown) {
+  } catch (error: unknown) {
     const msg              = error instanceof Error ? error.message : String(error);
     const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED');
-    const isEmbedExhausted = msg.includes('EMBED_EXHAUSTED'); 
-    // Ensure both generation timeouts and embedding timeouts are caught here
+    const isEmbedExhausted = msg.includes('EMBED_EXHAUSTED');
     const isTimeout        = msg.startsWith('TIMEOUT:') || msg.includes('EMBED_TIMEOUT');
 
     logger.error('Error in /ask_indra', error, { requestId });
@@ -1158,7 +1287,7 @@ ${context}`;
 });
 
 // ============================================================================
-// ── 13. ERROR HANDLING & STARTUP
+// ── 16. ERROR HANDLING & STARTUP
 // ============================================================================
 
 app.use((_req: Request, res: Response): void => {
@@ -1172,16 +1301,19 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void 
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀  INDRA RAG Backend v13.2.0`);
+  console.log(`\n🚀  INDRA RAG Backend v14.0.0`);
   console.log(`🌐  http://localhost:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth + Injection Guard`);
-  console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
-  console.log(`🔑  Rerank key   : ${rerankRoster.length} models — cross-encoder reranking active`);
+  console.log(`🔑  Groq keys    : ${groqRoster.length} keys (llama-3.3-70b-versatile) — PRIMARY generation`);
+  console.log(`🔑  Gemini key   : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')}) — generation fallback`);
+  console.log(`🔑  Rerank key   : ${rerankRoster.length} models — rerank + last-resort generation`);
+  console.log(`🔀  Gen chain    : Groq #1 → Groq #2 → Gemini primary → Gemini rerank key`);
+  console.log(`🔀  Rerank chain : Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity`);
   console.log(`🧠  Embed model  : nomic-embed-text-v1.5 (Nomic Atlas)`);
   console.log(`🧠  RAG Engine   : Embed → Vector Search → Cross-Encoder Rerank → CAD Match → Keyword Shield`);
   console.log(`🔩  CAD Layer    : Keyword-first → Rule-fallback → Category-scan`);
   console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries`);
-  console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per Gemini call`);
+  console.log(`⏱️   Timeout      : ${CONFIG.GEMINI_TIMEOUT_MS / 1000}s per model call`);
   console.log(`🚫  Fallback     : No generic AI fallback — INDRA answers from rulebook only\n`);
 });
