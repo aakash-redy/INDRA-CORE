@@ -4,9 +4,9 @@ import {
   MessageSquare, BrainCircuit, CheckCircle2, XCircle,
   ChevronRight, Menu, X, LogOut,
   Box, Maximize2, Download, ZoomIn, ZoomOut, RotateCw,
-  Eye, EyeOff, Play, 
+  Eye, EyeOff, Play,
   Target, Activity, Zap, Loader2, Ruler,
-  Crosshair, Minimize2, Layers, RefreshCw
+  Crosshair, Minimize2, Layers, RefreshCw, AlertCircle
 } from "lucide-react";
 import { createClient, Session } from '@supabase/supabase-js';
 
@@ -113,26 +113,17 @@ const QUICK_QUERIES = [
 const sanitizeInput = (s: string) => s.trim().slice(0, MAX_MESSAGE_LENGTH);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH 1 — renderTextWithCitations
-// Splits bot answer text on [CITE:rule_id] tokens injected by the backend,
-// wraps each with an inline orange numbered badge, and falls back to plain
-// text when no tokens are found.
+// RENDER TEXT WITH CITATIONS
 // ─────────────────────────────────────────────────────────────────────────────
 function renderTextWithCitations(text: string, citations?: Citation[]): React.ReactNode {
   if (!citations || citations.length === 0) return <span>{text}</span>;
-
-  // Build a lookup: rule_id → badge index (1-based)
   const ruleIndex = new Map<string, number>();
   citations.forEach((c, i) => ruleIndex.set(c.rule_id, i + 1));
-
-  // Split on [CITE:rule_id] tokens
   const parts = text.split(/\[CITE:([^\]]+)\]/g);
-
   return (
     <>
       {parts.map((part, i) => {
         if (i % 2 === 0) return <span key={i}>{part}</span>;
-        // Odd indexes are the captured rule_id
         const ruleId = part;
         const num = ruleIndex.get(ruleId) ?? '?';
         const citation = citations.find(c => c.rule_id === ruleId);
@@ -197,6 +188,19 @@ function TelemetryStrip() {
 
 function Scanlines() { return <div className="pointer-events-none absolute inset-0 z-0 opacity-[0.025]" style={{ backgroundImage: 'repeating-linear-gradient(to bottom, transparent, transparent 2px, rgba(255,255,255,0.4) 2px, rgba(255,255,255,0.4) 4px)' }} />; }
 
+// ── Toast notification ──
+function Toast({ message, type, onClose }: { message: string; type: 'error' | 'success'; onClose: () => void }) {
+  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
+  return (
+    <div className={`fixed bottom-6 right-6 z-[100] flex items-center gap-3 px-4 py-3 text-xs font-bold shadow-2xl border animate-in slide-in-from-bottom-4 duration-300
+      ${type === 'error' ? 'bg-red-950 border-red-700/50 text-red-300' : 'bg-green-950 border-green-700/50 text-green-300'}`}>
+      {type === 'error' ? <AlertCircle size={14} /> : <CheckCircle2 size={14} />}
+      {message}
+      <button onClick={onClose} className="ml-2 opacity-60 hover:opacity-100"><X size={12} /></button>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MESH MATCHING UTILITY
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,7 +236,10 @@ export default function IndraWorkspace() {
   const [appMode, setAppMode] = useState<"ask" | "quiz">("ask");
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [focusedPanel, setFocusedPanel] = useState<FocusedPanel>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
+
   const toggleFocus = useCallback((panel: FocusedPanel) => setFocusedPanel(prev => prev === panel ? null : panel), []);
+  const showToast = useCallback((message: string, type: 'error' | 'success') => setToast({ message, type }), []);
 
   // Chat State
   const [messages, setMessages] = useState<Message[]>([]);
@@ -248,14 +255,12 @@ export default function IndraWorkspace() {
   const [modelParts, setModelParts] = useState<string[]>([]);
   const [highlightMeshes, setHighlightMeshes] = useState<string[]>([]);
   const [contextMeshes, setContextMeshes] = useState<string[]>([]);
-  // Multi-select: empty = show all highlights, non-empty = only those parts are orange
   const [isolatedParts, setIsolatedParts] = useState<string[]>([]);
   const [highlightSelected, setHighlightSelected] = useState(true);
   const [isolationMode, setIsolationMode] = useState<IsolationMode>('ghost');
   const [isModelLoading, setIsModelLoading] = useState(false);
   const [modelLoadProgress, setModelLoadProgress] = useState(0);
   const [is3DFullscreen, setIs3DFullscreen] = useState(false);
-  // PATCH 4 — showModelInfo now has a visible toggle button in the 3D panel header
   const [showModelInfo, setShowModelInfo] = useState(true);
   const [autoRotateEnabled, setAutoRotateEnabled] = useState(true);
   const [showDebug, setShowDebug] = useState(false);
@@ -263,16 +268,19 @@ export default function IndraWorkspace() {
   // Quiz State
   const [qIndex, setQIndex] = useState(0);
   const [selectedAns, setSelectedAns] = useState<number | null>(null);
-  // PATCH 2 — isAnsChecked now drives visual feedback on option buttons + explanation
   const [isAnsChecked, setIsAnsChecked] = useState(false);
   const [quizScore, setQuizScore] = useState(0);
   const [quizFinished, setQuizFinished] = useState(false);
+  // BUG 5 FIX: track if score was already counted for this question
+  const [scoreCounted, setScoreCounted] = useState(false);
 
   // Refs
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const modelViewerRef = useRef<any>(null);
   const originalMaterialsRef = useRef<Map<string, number[]>>(new Map());
+  // BUG 3 FIX: use a ref for handle3DModelLoad so sendMessage can safely call it before definition
+  const handle3DModelLoadRef = useRef<Function | null>(null);
 
   // ── Effects ──
   useEffect(() => {
@@ -295,9 +303,7 @@ export default function IndraWorkspace() {
   const applyMeshStates = useCallback(() => {
     const mv = modelViewerRef.current;
     if (!mv?.model?.materials) return;
-
     const materials = mv.model.materials;
-    // Multi-select: if parts are toggled, only those are orange; else all highlightMeshes.
     const activeTargets = isolatedParts.length > 0 ? isolatedParts : highlightMeshes;
     const siblingTargets = isolatedParts.length > 0
       ? highlightMeshes.filter(m => !isolatedParts.includes(m))
@@ -307,7 +313,6 @@ export default function IndraWorkspace() {
       const matName = mat.name || `Unnamed_Material_${index}`;
       mat.name = matName;
       const original = originalMaterialsRef.current.get(matName) ?? [0.7, 0.7, 0.7, 1.0];
-
       const isActive  = matchesMeshName(matName, activeTargets);
       const isSibling = matchesMeshName(matName, siblingTargets);
       const isContext = matchesMeshName(matName, contextMeshes);
@@ -345,7 +350,6 @@ export default function IndraWorkspace() {
         }
       }
     });
-
     if (typeof mv.queueRender === 'function') mv.queueRender();
   }, [isolatedParts, highlightSelected, highlightMeshes, contextMeshes, isolationMode]);
 
@@ -353,6 +357,9 @@ export default function IndraWorkspace() {
     if (activeModelUrl) applyMeshStates();
   }, [isolatedParts, highlightSelected, highlightMeshes, contextMeshes, isolationMode, applyMeshStates, activeModelUrl]);
 
+  // BUG 2 FIX: Stable effect — applyMeshStates is called directly inside the handler
+  // so it doesn't need to be in the dep array. The cleanup correctly removes the exact
+  // same handler function references that were added.
   useEffect(() => {
     const mv = modelViewerRef.current;
     if (!mv) return;
@@ -360,32 +367,39 @@ export default function IndraWorkspace() {
     const handleModelReady = () => {
       const materials = mv.model?.materials;
       if (!materials) return;
-
       const parts: string[] = [];
       materials.forEach((mat: any, index: number) => {
         const matName = mat.name || `Unnamed_Material_${index}`;
         mat.name = matName;
         parts.push(matName);
-
         if (!originalMaterialsRef.current.has(matName)) {
           const color = mat.pbrMetallicRoughness?.baseColorFactor ?? [0.7, 0.7, 0.7, 1];
           originalMaterialsRef.current.set(matName, [...color]);
         }
       });
-
       setModelParts(parts);
       applyMeshStates();
     };
 
+    // BUG 4 FIX: Use model-viewer's real 'progress' event instead of fake setInterval
+    const handleProgress = (e: any) => {
+      const pct = Math.round((e.detail?.totalProgress ?? 0) * 100);
+      setModelLoadProgress(pct);
+      if (pct >= 100) setIsModelLoading(false);
+    };
+
     mv.addEventListener('load', handleModelReady);
     mv.addEventListener('scene-graph-ready', handleModelReady);
+    mv.addEventListener('progress', handleProgress);
     if (mv.model) handleModelReady();
 
     return () => {
       mv.removeEventListener('load', handleModelReady);
       mv.removeEventListener('scene-graph-ready', handleModelReady);
+      mv.removeEventListener('progress', handleProgress);
     };
-  }, [activeModelUrl, applyMeshStates]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeModelUrl]); // applyMeshStates intentionally excluded — called directly inside handler
 
   useEffect(() => {
     if (activeModelUrl) {
@@ -396,7 +410,8 @@ export default function IndraWorkspace() {
   }, [activeModelUrl]);
 
   // ── Auth ──
-  const handleAuthSubmit = async (e: React.FormEvent) => {
+  // Minor fix: wrapped in useCallback for consistency
+  const handleAuthSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setIsAuthLoading(true);
     setAuthMessage(null);
@@ -424,14 +439,41 @@ export default function IndraWorkspace() {
     } finally {
       setIsAuthLoading(false);
     }
-  };
+  }, [authEmail, authPassword, isSignUp]);
 
-  // PATCH 3 — copyToClipboard is now wired to copy buttons on bot messages
   const copyToClipboard = useCallback(async (text: string, id: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(id);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      showToast('Failed to copy to clipboard', 'error');
+    }
+  }, [showToast]);
+
+  // BUG 3 FIX: define handle3DModelLoad BEFORE sendMessage, and also assign to ref
+  const handle3DModelLoad = useCallback((
+    url: string,
+    meta?: ModelMetadata,
+    nodes?: CadNode[],
+    highlights: string[] = [],
+    contexts: string[] = [],
+  ) => {
+    originalMaterialsRef.current.clear();
+    setActiveModelUrl(url);
+    setActiveModelMetadata(meta ?? null);
+    setActiveCadNodes(nodes ?? []);
+    setHighlightMeshes(highlights);
+    setContextMeshes(contexts);
+    setIsolatedParts([]);
+    setModelParts([]);
+    setIsModelLoading(true);
+    setModelLoadProgress(0);
+    // BUG 4 FIX: No fake setInterval — real progress comes from model-viewer 'progress' event in useEffect
   }, []);
+
+  // Keep ref in sync so sendMessage can call it safely
+  useEffect(() => { handle3DModelLoadRef.current = handle3DModelLoad; }, [handle3DModelLoad]);
 
   // ── Send Message ──
   const sendMessage = useCallback(async (text: string) => {
@@ -444,13 +486,16 @@ export default function IndraWorkspace() {
     setInput("");
     setIsThinking(true);
 
-    setActiveModelUrl(null);
-    setActiveModelMetadata(null);
-    setActiveCadNodes([]);
-    setHighlightMeshes([]);
-    setContextMeshes([]);
-    setIsolatedParts([]);
-    setModelParts([]);
+    // BUG 1 FIX: Only reset 3D state if a model is not currently loading
+    if (!isModelLoading) {
+      setActiveModelUrl(null);
+      setActiveModelMetadata(null);
+      setActiveCadNodes([]);
+      setHighlightMeshes([]);
+      setContextMeshes([]);
+      setIsolatedParts([]);
+      setModelParts([]);
+    }
 
     try {
       if (!session?.access_token) throw new Error('Authentication token missing.');
@@ -475,8 +520,8 @@ export default function IndraWorkspace() {
         timestamp: Date.now()
       }]);
 
-      if (data.model_url) {
-        handle3DModelLoad(
+      if (data.model_url && handle3DModelLoadRef.current) {
+        handle3DModelLoadRef.current(
           data.model_url,
           data.model_metadata,
           data.cad_nodes,
@@ -486,39 +531,12 @@ export default function IndraWorkspace() {
       }
     } catch (err: any) {
       setMessages(p => [...p, { id: crypto.randomUUID(), role: "error", text: err.message, timestamp: Date.now() }]);
+      showToast(err.message, 'error');
     } finally {
       setIsThinking(false);
       inputRef.current?.focus();
     }
-  }, [isThinking, lastMessageTime, session]);
-
-  // ── 3D Model Load ──
-  const handle3DModelLoad = useCallback((
-    url: string,
-    meta?: ModelMetadata,
-    nodes?: CadNode[],
-    highlights: string[] = [],
-    contexts: string[] = [],
-  ) => {
-    originalMaterialsRef.current.clear();
-    setActiveModelUrl(url);
-    setActiveModelMetadata(meta ?? null);
-    setActiveCadNodes(nodes ?? []);
-    setHighlightMeshes(highlights);
-    setContextMeshes(contexts);
-    setIsolatedParts([]);
-    setModelParts([]);
-    setIsModelLoading(true);
-    setModelLoadProgress(0);
-
-    // PATCH 5 — progress bar now has a real home at the bottom of the 3D panel
-    let prog = 0;
-    const iv = setInterval(() => {
-      prog += 15;
-      setModelLoadProgress(Math.min(prog, 100));
-      if (prog >= 100) { clearInterval(iv); setIsModelLoading(false); }
-    }, 150);
-  }, []);
+  }, [isThinking, lastMessageTime, session, isModelLoading, showToast]);
 
   const close3DModel = useCallback(() => {
     setActiveModelUrl(null);
@@ -540,7 +558,6 @@ export default function IndraWorkspace() {
 
   const clearIsolation = useCallback(() => { setIsolatedParts([]); }, []);
 
-  // PATCH 5 — download error is now surfaced via console + alert (non-intrusive)
   const downloadModel = useCallback(async () => {
     if (!activeModelUrl) return;
     try {
@@ -555,11 +572,11 @@ export default function IndraWorkspace() {
       a.click();
       URL.revokeObjectURL(url);
       document.body.removeChild(a);
+      showToast('Model downloaded successfully', 'success');
     } catch (err: any) {
-      console.error('Model download failed:', err);
-      alert(`Download failed: ${err.message}`);
+      showToast(`Download failed: ${err.message}`, 'error');
     }
-  }, [activeModelUrl, activeModelMetadata]);
+  }, [activeModelUrl, activeModelMetadata, showToast]);
 
   const zoomIn  = useCallback(() => modelViewerRef.current?.zoom(-1), []);
   const zoomOut = useCallback(() => modelViewerRef.current?.zoom(1), []);
@@ -573,6 +590,17 @@ export default function IndraWorkspace() {
       .replace(/\b\w/g, l => l.toUpperCase())
       .trim() || name;
 
+  const clearChat = useCallback(() => {
+    setMessages([]);
+    setActiveModelUrl(null);
+    setActiveModelMetadata(null);
+    setActiveCadNodes([]);
+    setHighlightMeshes([]);
+    setContextMeshes([]);
+    setIsolatedParts([]);
+    setModelParts([]);
+  }, []);
+
   // ─────────────────────────────────────────────────────────────────────────────
   // LOGIN SCREEN
   // ─────────────────────────────────────────────────────────────────────────────
@@ -580,28 +608,75 @@ export default function IndraWorkspace() {
     return (
       <div className="relative flex min-h-screen items-center justify-center bg-[#060606] overflow-hidden" style={{ fontFamily: "'Rajdhani', 'DIN Next', system-ui, sans-serif" }}>
         <div className="absolute inset-0 opacity-[0.04]" style={{ backgroundImage: 'linear-gradient(rgba(255,40,0,0.6) 1px, transparent 1px), linear-gradient(90deg, rgba(255,40,0,0.6) 1px, transparent 1px)', backgroundSize: '60px 60px' }} />
+
+        {/* Animated accent lines */}
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-px h-32 bg-gradient-to-b from-transparent to-[#FF2800]/40" />
+        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-px h-32 bg-gradient-to-t from-transparent to-[#FF2800]/40" />
+
         <div className="relative z-10 w-full max-w-[420px] px-4">
           <div className="text-center mb-10">
+            {/* Logo mark */}
+            <div className="inline-flex items-center justify-center w-14 h-14 border border-[#FF2800]/30 mb-6 relative">
+              <Zap size={22} className="text-[#FF2800]" />
+              <span className="absolute inset-0 border border-[#FF2800]/10 scale-110" />
+            </div>
             <h1 className="text-5xl font-black text-white tracking-tighter">INDRA</h1>
             <p className="text-[#FF2800] text-sm font-bold tracking-[0.25em] mt-1">FORMULA BHARAT 2027</p>
+            <p className="text-slate-600 text-xs mt-3 tracking-widest uppercase">Regulation Intelligence System</p>
           </div>
-          <form onSubmit={handleAuthSubmit} className="space-y-4 bg-[#0c0c0c] border border-white/[0.06] p-8">
-            <input type="email" required value={authEmail} onChange={e => setAuthEmail(e.target.value)} className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none" placeholder="Email" />
-            <input type="password" required value={authPassword} onChange={e => setAuthPassword(e.target.value)} className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none" placeholder="Password" />
+
+          <form onSubmit={handleAuthSubmit} className="space-y-3 bg-[#0c0c0c] border border-white/[0.06] p-8">
+            <div className="relative">
+              <input
+                type="email"
+                required
+                value={authEmail}
+                onChange={e => setAuthEmail(e.target.value)}
+                className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none transition-colors peer"
+                placeholder=" "
+                id="auth-email"
+              />
+              <label htmlFor="auth-email" className="absolute left-4 top-3 text-slate-600 text-sm pointer-events-none transition-all peer-focus:-top-2.5 peer-focus:text-[10px] peer-focus:text-[#FF2800]/70 peer-[:not(:placeholder-shown)]:-top-2.5 peer-[:not(:placeholder-shown)]:text-[10px] bg-[#111] px-1">Email</label>
+            </div>
+            <div className="relative">
+              <input
+                type="password"
+                required
+                value={authPassword}
+                onChange={e => setAuthPassword(e.target.value)}
+                className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none transition-colors peer"
+                placeholder=" "
+                id="auth-password"
+              />
+              <label htmlFor="auth-password" className="absolute left-4 top-3 text-slate-600 text-sm pointer-events-none transition-all peer-focus:-top-2.5 peer-focus:text-[10px] peer-focus:text-[#FF2800]/70 peer-[:not(:placeholder-shown)]:-top-2.5 peer-[:not(:placeholder-shown)]:text-[10px] bg-[#111] px-1">Password</label>
+            </div>
+
             {authMessage && (
-              <div className={`text-xs font-bold p-3 ${authMessage.type === 'success' ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'}`}>
+              <div className={`flex items-center gap-2 text-xs font-bold p-3 ${authMessage.type === 'success' ? 'bg-green-900/30 text-green-400 border border-green-800/30' : 'bg-red-900/30 text-red-400 border border-red-800/30'}`}>
+                {authMessage.type === 'error' ? <AlertCircle size={13} /> : <CheckCircle2 size={13} />}
                 {authMessage.text}
               </div>
             )}
-            <button type="submit" disabled={isAuthLoading} className="w-full py-4 bg-[#FF2800] text-white font-black text-[11px] tracking-[0.3em] uppercase hover:bg-[#FF4000] transition-colors">
-              {isAuthLoading ? "AUTHENTICATING..." : isSignUp ? "CREATE ACCOUNT" : "LAUNCH INDRA"}
+
+            <button
+              type="submit"
+              disabled={isAuthLoading}
+              className="relative w-full py-4 bg-[#FF2800] text-white font-black text-[11px] tracking-[0.3em] uppercase hover:bg-[#FF4000] transition-colors overflow-hidden group disabled:opacity-60"
+            >
+              <span className="absolute inset-0 bg-white/10 translate-x-[-110%] group-hover:translate-x-[110%] transition-transform duration-500 skew-x-12" />
+              {isAuthLoading ? (
+                <span className="flex items-center justify-center gap-2"><Loader2 size={14} className="animate-spin" /> AUTHENTICATING...</span>
+              ) : isSignUp ? "CREATE ACCOUNT" : "LAUNCH INDRA"}
             </button>
-            <div className="text-center">
-              <button type="button" onClick={() => setIsSignUp(!isSignUp)} className="text-slate-400 text-xs hover:text-white">
-                {isSignUp ? "Already have access? Sign in" : "Request new access"}
+
+            <div className="text-center pt-1">
+              <button type="button" onClick={() => { setIsSignUp(!isSignUp); setAuthMessage(null); }} className="text-slate-500 text-xs hover:text-slate-300 transition-colors">
+                {isSignUp ? "Already have access? Sign in" : "Request new access →"}
               </button>
             </div>
           </form>
+
+          <p className="text-center text-slate-700 text-[10px] mt-6 tracking-widest uppercase">Authorized personnel only</p>
         </div>
       </div>
     );
@@ -624,6 +699,9 @@ export default function IndraWorkspace() {
         </div>
       )}
 
+      {/* Toast */}
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+
       {isSidebarOpen && <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[45] md:hidden" onClick={() => setIsSidebarOpen(false)} />}
 
       {/* ─── SIDEBAR ─────────────────────────────────────────────────────────── */}
@@ -631,34 +709,55 @@ export default function IndraWorkspace() {
         <aside className="flex flex-col h-full bg-[#080808] border-r border-white/[0.05]">
           <div className="px-6 pt-6 pb-5 border-b border-white/[0.05] flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <Zap size={16} className="text-[#FF2800]" />
-              <div className="text-[11px] font-black text-white">INDRA OS</div>
+              <div className="relative">
+                <Zap size={16} className="text-[#FF2800]" />
+                <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-[#FF2800] rounded-full animate-pulse" />
+              </div>
+              <div className="text-[11px] font-black text-white tracking-wider">INDRA OS</div>
             </div>
             <div className="flex items-center gap-2">
               <FocusButton panel="sidebar" focusedPanel={focusedPanel} onToggle={toggleFocus} />
               <button onClick={() => setIsSidebarOpen(false)} className="md:hidden p-2 text-slate-500"><X size={18} /></button>
             </div>
           </div>
-          <div className="p-4">
+
+          <div className="p-4 space-y-1">
             <button
-              onClick={() => { setAppMode("ask"); setMessages([]); setActiveModelUrl(null); setHighlightMeshes([]); setContextMeshes([]); setIsolatedParts([]); setIsSidebarOpen(false); }}
-              className="w-full flex items-center gap-2.5 px-4 py-3 bg-[#FF2800]/10 border border-[#FF2800]/20 text-[10px] font-bold text-[#FF2800] uppercase"
+              onClick={() => { clearChat(); setIsSidebarOpen(false); }}
+              className="w-full flex items-center gap-2.5 px-4 py-3 bg-[#FF2800]/10 border border-[#FF2800]/20 text-[10px] font-bold text-[#FF2800] uppercase hover:bg-[#FF2800]/15 transition-colors group"
             >
-              <Plus size={13} /> New Query
+              <Plus size={13} className="group-hover:rotate-90 transition-transform duration-200" /> New Query
             </button>
           </div>
+
           <div className="px-4 mb-2 flex-1">
-            <button onClick={() => { setAppMode("ask"); setIsSidebarOpen(false); }} className="w-full flex items-center gap-3 px-3 py-3 mb-1 text-left text-[#FF2800]">
+            <p className="text-[8px] font-bold text-slate-700 uppercase tracking-[0.2em] px-3 mb-2">Navigation</p>
+            <button
+              onClick={() => { setAppMode("ask"); setIsSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-3 mb-1 text-left transition-colors rounded-sm ${appMode === 'ask' ? 'text-[#FF2800] bg-[#FF2800]/5' : 'text-slate-500 hover:text-slate-300'}`}
+            >
               <MessageSquare size={13} />
               <div className="text-[10px] font-bold uppercase">Regulation Query</div>
+              {appMode === 'ask' && <div className="ml-auto w-1 h-1 bg-[#FF2800] rounded-full" />}
             </button>
-            <button onClick={() => { setAppMode("quiz"); setIsSidebarOpen(false); }} className="w-full flex items-center gap-3 px-3 py-3 text-left text-slate-500 hover:text-slate-300">
+            <button
+              onClick={() => { setAppMode("quiz"); setIsSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-3 text-left transition-colors rounded-sm ${appMode === 'quiz' ? 'text-[#FF2800] bg-[#FF2800]/5' : 'text-slate-500 hover:text-slate-300'}`}
+            >
               <BrainCircuit size={13} />
               <div className="text-[10px] font-bold uppercase">Compliance Test</div>
+              {appMode === 'quiz' && <div className="ml-auto w-1 h-1 bg-[#FF2800] rounded-full" />}
             </button>
           </div>
+
+          {/* Session info */}
           <div className="px-6 py-4 border-t border-white/[0.05]">
-            <button onClick={() => supabase.auth.signOut()} className="flex items-center gap-2 text-[9px] text-slate-600 hover:text-slate-400 uppercase tracking-widest">
+            <p className="text-[8px] text-slate-700 uppercase tracking-widest mb-2">Session</p>
+            <p className="text-[9px] text-slate-500 truncate mb-3">{session.user?.email}</p>
+            <button
+              onClick={() => supabase.auth.signOut()}
+              className="flex items-center gap-2 text-[9px] text-slate-600 hover:text-[#FF2800] uppercase tracking-widest transition-colors"
+            >
               <LogOut size={11} /> Sign Out
             </button>
           </div>
@@ -669,7 +768,7 @@ export default function IndraWorkspace() {
       <main className="flex-1 flex flex-col h-full min-w-0 relative z-10">
         <header className="shrink-0 h-12 flex items-center justify-between px-4 md:px-6 border-b border-white/[0.05] bg-black/60 backdrop-blur-md relative z-30">
           <div className="flex items-center gap-3">
-            <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 text-slate-500"><Menu size={20} /></button>
+            <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 text-slate-500 hover:text-white transition-colors"><Menu size={20} /></button>
             <div className="flex items-center gap-2 text-[10px] md:text-[9px] font-bold tracking-[0.25em] uppercase">
               <span className="text-slate-700">INDRA</span>
               <ChevronRight size={10} className="text-slate-800" />
@@ -688,19 +787,39 @@ export default function IndraWorkspace() {
               <>
                 <div className="shrink-0 flex items-center justify-between px-4 md:px-6 pt-3 pb-1">
                   <span className="text-[8px] font-bold tracking-[0.3em] text-slate-700 uppercase">Query Engine</span>
-                  <FocusButton panel="chat" focusedPanel={focusedPanel} onToggle={toggleFocus} />
+                  <div className="flex items-center gap-2">
+                    {messages.length > 0 && (
+                      <button
+                        onClick={clearChat}
+                        title="Clear conversation"
+                        className="flex items-center gap-1 px-2 py-1 text-[8px] font-bold text-slate-600 hover:text-[#FF2800] border border-transparent hover:border-[#FF2800]/20 transition-all uppercase tracking-wider"
+                      >
+                        <Trash2 size={9} /> Clear
+                      </button>
+                    )}
+                    <FocusButton panel="chat" focusedPanel={focusedPanel} onToggle={toggleFocus} />
+                  </div>
                 </div>
 
                 <div className="flex-1 overflow-y-auto px-4 md:px-6 py-4 scroll-smooth">
                   {messages.length === 0 && !isThinking ? (
                     <div className="h-full flex flex-col items-center justify-center max-w-xl mx-auto text-center">
-                      <Target size={28} className="text-[#FF2800]/70 mb-4" />
-                      <h2 className="text-xl md:text-2xl font-black tracking-tight text-white mb-8 uppercase">Ready for Input</h2>
+                      <div className="relative mb-6">
+                        <Target size={28} className="text-[#FF2800]/70" />
+                        <div className="absolute inset-0 blur-xl bg-[#FF2800]/20 rounded-full" />
+                      </div>
+                      <h2 className="text-xl md:text-2xl font-black tracking-tight text-white mb-2 uppercase">Ready for Input</h2>
+                      <p className="text-slate-600 text-xs mb-8 tracking-wider">Ask anything about Formula Bharat 2027 regulations</p>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
                         {QUICK_QUERIES.map((q, i) => (
-                          <button key={i} onClick={() => setInput(q.label)} className="flex items-center gap-3 px-4 py-3 md:py-4 bg-[#0c0c0c] border border-white/[0.06] hover:border-[#FF2800]/30 text-left">
-                            <span className="text-[#FF2800]/50 shrink-0">{q.icon}</span>
-                            <span className="text-[10px] font-bold tracking-wider uppercase text-slate-400">{q.label}</span>
+                          <button
+                            key={i}
+                            onClick={() => { setInput(q.label); inputRef.current?.focus(); }}
+                            className="flex items-center gap-3 px-4 py-3 md:py-4 bg-[#0c0c0c] border border-white/[0.06] hover:border-[#FF2800]/30 hover:bg-[#FF2800]/5 text-left transition-all group"
+                          >
+                            <span className="text-[#FF2800]/50 shrink-0 group-hover:text-[#FF2800]/80 transition-colors">{q.icon}</span>
+                            <span className="text-[10px] font-bold tracking-wider uppercase text-slate-400 group-hover:text-slate-200 transition-colors">{q.label}</span>
+                            <ChevronRight size={9} className="ml-auto text-slate-700 group-hover:text-[#FF2800]/50 transition-colors" />
                           </button>
                         ))}
                       </div>
@@ -709,12 +828,21 @@ export default function IndraWorkspace() {
                     <div className="max-w-3xl mx-auto space-y-6 pb-6">
                       {messages.map(msg => (
                         <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-                          <span className={`text-[8px] tracking-[0.3em] uppercase mb-1.5 font-bold ${msg.role === 'user' ? 'text-slate-600' : 'text-[#FF2800]/60'}`}>
-                            {msg.role === 'user' ? 'YOU' : 'INDRA'}
+                          <span className={`text-[8px] tracking-[0.3em] uppercase mb-1.5 font-bold ${msg.role === 'user' ? 'text-slate-600' : msg.role === 'error' ? 'text-red-500/60' : 'text-[#FF2800]/60'}`}>
+                            {msg.role === 'user' ? 'YOU' : msg.role === 'error' ? 'ERROR' : 'INDRA'}
                           </span>
-                          <div className={`relative p-4 md:p-5 text-sm leading-relaxed w-full ${msg.role === 'user' ? 'bg-white/[0.06] border border-white/[0.08]' : 'bg-[#0c0c0c] border border-white/[0.07] border-l-2 border-l-[#FF2800]/60'}`}>
+                          <div className={`relative p-4 md:p-5 text-sm leading-relaxed w-full transition-all
+                            ${msg.role === 'user' ? 'bg-white/[0.06] border border-white/[0.08]' :
+                              msg.role === 'error' ? 'bg-red-950/30 border border-red-800/30 border-l-2 border-l-red-500/60' :
+                              'bg-[#0c0c0c] border border-white/[0.07] border-l-2 border-l-[#FF2800]/60'}`}>
 
-                            {/* PATCH 1 — inline citation badges rendered in text */}
+                            {msg.role === 'error' && (
+                              <div className="flex items-center gap-2 mb-2 text-red-400">
+                                <AlertCircle size={13} />
+                                <span className="text-[9px] font-black uppercase tracking-widest">System Error</span>
+                              </div>
+                            )}
+
                             <p className="whitespace-pre-wrap">
                               {msg.role === 'bot'
                                 ? renderTextWithCitations(msg.text, msg.citations)
@@ -722,7 +850,6 @@ export default function IndraWorkspace() {
                               }
                             </p>
 
-                            {/* PATCH 1 — citation legend below bot answers */}
                             {msg.role === 'bot' && msg.citations && msg.citations.length > 0 && (
                               <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
                                 {msg.citations.map((c, i) => (
@@ -734,7 +861,6 @@ export default function IndraWorkspace() {
                               </div>
                             )}
 
-                            {/* PATCH 3 — copy button on bot messages */}
                             {msg.role === 'bot' && (
                               <button
                                 onClick={() => copyToClipboard(msg.text, msg.id)}
@@ -748,7 +874,11 @@ export default function IndraWorkspace() {
                               </button>
                             )}
 
-                            {/* Load 3D model button */}
+                            {/* Timestamp */}
+                            <div className="mt-2 text-[8px] text-slate-700 font-mono">
+                              {new Date(msg.timestamp).toLocaleTimeString()}
+                            </div>
+
                             {msg.model_url && msg.role === 'bot' && (
                               <div className="mt-4 pt-4 border-t border-white/[0.07]">
                                 <button
@@ -759,9 +889,9 @@ export default function IndraWorkspace() {
                                     msg.highlight_meshes ?? [],
                                     msg.context_meshes ?? [],
                                   )}
-                                  className="flex items-center gap-2 px-4 py-3 md:py-2.5 text-[10px] font-black bg-[#FF2800]/10 border border-[#FF2800]/30 text-[#FF2800] uppercase w-full md:w-auto justify-center"
+                                  className="flex items-center gap-2 px-4 py-3 md:py-2.5 text-[10px] font-black bg-[#FF2800]/10 border border-[#FF2800]/30 text-[#FF2800] uppercase w-full md:w-auto justify-center hover:bg-[#FF2800]/15 transition-colors group"
                                 >
-                                  <Box size={14} /> Load 3D Model
+                                  <Box size={14} className="group-hover:rotate-12 transition-transform" /> Load 3D Model
                                 </button>
                               </div>
                             )}
@@ -770,7 +900,13 @@ export default function IndraWorkspace() {
                       ))}
                       {isThinking && (
                         <div className="flex items-center gap-3 text-[9px] text-[#FF2800]/60 uppercase">
-                          <Loader2 size={12} className="animate-spin" /> Scanning...
+                          <Loader2 size={12} className="animate-spin" />
+                          <span>Scanning regulations...</span>
+                          <span className="flex gap-0.5">
+                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                          </span>
                         </div>
                       )}
                       <div ref={bottomRef} />
@@ -779,23 +915,35 @@ export default function IndraWorkspace() {
                 </div>
 
                 <div className="shrink-0 px-4 md:px-6 py-4 pb-[env(safe-area-inset-bottom)] bg-[#060606] border-t border-white/[0.04]">
-                  <div className="max-w-3xl mx-auto relative flex flex-row items-center gap-2">
-                    <input
-                      ref={inputRef}
-                      value={input}
-                      onChange={e => setInput(e.target.value)}
-                      onKeyDown={e => { if (e.key === 'Enter') sendMessage(input); }}
-                      placeholder="Query regulations..."
-                      disabled={isThinking}
-                      className="flex-1 bg-[#0c0c0c] border border-white/[0.07] focus:border-[#FF2800]/30 px-4 py-4 text-sm text-white placeholder:text-slate-600 focus:outline-none"
-                    />
-                    <button
-                      onClick={() => sendMessage(input)}
-                      disabled={isThinking || !input.trim()}
-                      className={`shrink-0 px-6 py-4 flex items-center justify-center gap-2 text-[10px] font-black uppercase transition-all ${input.trim() && !isThinking ? 'bg-[#FF2800] text-white' : 'bg-white/5 text-slate-600'}`}
-                    >
-                      {isThinking ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                    </button>
+                  <div className="max-w-3xl mx-auto">
+                    {/* Character count */}
+                    {input.length > 800 && (
+                      <div className="flex justify-end mb-1">
+                        <span className={`text-[9px] font-mono ${input.length > 950 ? 'text-[#FF2800]' : 'text-slate-600'}`}>
+                          {input.length}/{MAX_MESSAGE_LENGTH}
+                        </span>
+                      </div>
+                    )}
+                    <div className="relative flex flex-row items-center gap-2">
+                      <input
+                        ref={inputRef}
+                        value={input}
+                        onChange={e => setInput(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
+                        placeholder="Query regulations..."
+                        disabled={isThinking}
+                        maxLength={MAX_MESSAGE_LENGTH}
+                        className="flex-1 bg-[#0c0c0c] border border-white/[0.07] focus:border-[#FF2800]/30 px-4 py-4 text-sm text-white placeholder:text-slate-600 focus:outline-none transition-colors"
+                      />
+                      <button
+                        onClick={() => sendMessage(input)}
+                        disabled={isThinking || !input.trim()}
+                        className={`shrink-0 px-6 py-4 flex items-center justify-center gap-2 text-[10px] font-black uppercase transition-all ${input.trim() && !isThinking ? 'bg-[#FF2800] text-white hover:bg-[#FF4000]' : 'bg-white/5 text-slate-600 cursor-not-allowed'}`}
+                      >
+                        {isThinking ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+                      </button>
+                    </div>
+                    <p className="text-[8px] text-slate-700 mt-1.5 text-center tracking-wider">Press Enter to send · Esc to exit focus</p>
                   </div>
                 </div>
               </>
@@ -807,30 +955,33 @@ export default function IndraWorkspace() {
                 <div className="flex-1 max-w-2xl mx-auto w-full">
                   {!quizFinished ? (
                     <>
-                      <div className="text-[#FF2800] text-xs font-black mb-2 uppercase tracking-widest">
-                        Question {qIndex + 1} / {QUIZ_QUESTIONS.length}
+                      {/* Progress bar */}
+                      <div className="flex items-center gap-3 mb-6">
+                        <div className="flex-1 h-px bg-white/[0.07]">
+                          <div
+                            className="h-full bg-[#FF2800] transition-all duration-500"
+                            style={{ width: `${((qIndex) / QUIZ_QUESTIONS.length) * 100}%` }}
+                          />
+                        </div>
+                        <span className="text-[#FF2800] text-xs font-black uppercase tracking-widest whitespace-nowrap">
+                          {qIndex + 1} / {QUIZ_QUESTIONS.length}
+                        </span>
                       </div>
-                      <h2 className="text-xl font-bold text-white mb-8">{QUIZ_QUESTIONS[qIndex].question}</h2>
+
+                      <h2 className="text-xl font-bold text-white mb-8 leading-snug">{QUIZ_QUESTIONS[qIndex].question}</h2>
 
                       <div className="space-y-3">
                         {QUIZ_QUESTIONS[qIndex].options.map((opt, i) => {
                           const isCorrect = i === QUIZ_QUESTIONS[qIndex].correctAnswer;
                           const isSelected = selectedAns === i;
-
-                          // PATCH 2 — per-option colour after CHECK ANSWER
-                          let optClass = 'border-white/10 hover:border-white/30 text-slate-300';
+                          let optClass = 'border-white/10 hover:border-white/30 text-slate-300 cursor-pointer';
                           if (isAnsChecked) {
-                            if (isCorrect) {
-                              optClass = 'border-green-500 bg-green-500/10 text-green-400';
-                            } else if (isSelected && !isCorrect) {
-                              optClass = 'border-red-500 bg-red-500/10 text-red-400';
-                            } else {
-                              optClass = 'border-white/5 text-slate-600';
-                            }
+                            if (isCorrect) optClass = 'border-green-500 bg-green-500/10 text-green-400 cursor-default';
+                            else if (isSelected && !isCorrect) optClass = 'border-red-500 bg-red-500/10 text-red-400 cursor-default';
+                            else optClass = 'border-white/5 text-slate-600 cursor-default';
                           } else if (isSelected) {
-                            optClass = 'border-[#FF2800] bg-[#FF2800]/10 text-white';
+                            optClass = 'border-[#FF2800] bg-[#FF2800]/10 text-white cursor-pointer';
                           }
-
                           return (
                             <button
                               key={i}
@@ -838,7 +989,6 @@ export default function IndraWorkspace() {
                               disabled={isAnsChecked}
                               className={`w-full text-left p-4 border transition-all flex items-center gap-3 ${optClass}`}
                             >
-                              {/* PATCH 2 — icon feedback */}
                               {isAnsChecked && isCorrect && <CheckCircle2 size={15} className="shrink-0 text-green-500" />}
                               {isAnsChecked && isSelected && !isCorrect && <XCircle size={15} className="shrink-0 text-red-500" />}
                               {!(isAnsChecked && (isCorrect || (isSelected && !isCorrect))) && (
@@ -852,7 +1002,6 @@ export default function IndraWorkspace() {
                         })}
                       </div>
 
-                      {/* PATCH 2 — explanation shown after checking */}
                       {isAnsChecked && (
                         <div className="mt-5 p-4 bg-[#0c0c0c] border border-white/[0.08] border-l-2 border-l-[#FF2800]/60 text-sm text-slate-300 leading-relaxed">
                           <span className="text-[9px] font-black uppercase tracking-widest text-[#FF2800]/70 block mb-1">Explanation</span>
@@ -861,42 +1010,54 @@ export default function IndraWorkspace() {
                       )}
 
                       <button
+                        // BUG 5 FIX: use scoreCounted flag to prevent double-increment
                         onClick={() => {
                           if (selectedAns === null) return;
                           if (!isAnsChecked) {
-                            // First click: reveal feedback
                             setIsAnsChecked(true);
-                            if (selectedAns === QUIZ_QUESTIONS[qIndex].correctAnswer) setQuizScore(s => s + 1);
+                            if (!scoreCounted && selectedAns === QUIZ_QUESTIONS[qIndex].correctAnswer) {
+                              setQuizScore(s => s + 1);
+                              setScoreCounted(true);
+                            }
                           } else {
-                            // Second click: advance
                             if (qIndex + 1 < QUIZ_QUESTIONS.length) {
                               setQIndex(i => i + 1);
                               setSelectedAns(null);
                               setIsAnsChecked(false);
+                              setScoreCounted(false);
                             } else {
                               setQuizFinished(true);
                             }
                           }
                         }}
                         disabled={selectedAns === null}
-                        className="mt-6 w-full py-4 bg-[#FF2800] text-white font-black text-sm disabled:opacity-30 uppercase tracking-widest transition-colors hover:bg-[#FF4000]"
+                        className="mt-6 w-full py-4 bg-[#FF2800] text-white font-black text-sm disabled:opacity-30 uppercase tracking-widest transition-colors hover:bg-[#FF4000] relative overflow-hidden group"
                       >
+                        <span className="absolute inset-0 bg-white/10 translate-x-[-110%] group-hover:translate-x-[110%] transition-transform duration-500 skew-x-12" />
                         {!isAnsChecked ? 'CHECK ANSWER' : qIndex + 1 < QUIZ_QUESTIONS.length ? 'NEXT QUESTION →' : 'SEE RESULTS'}
                       </button>
                     </>
                   ) : (
                     <div className="text-center py-12">
-                      <h2 className="text-3xl font-black text-white">Quiz Complete!</h2>
-                      <p className="text-6xl font-black text-[#FF2800] my-6">{quizScore}/{QUIZ_QUESTIONS.length}</p>
+                      <div className="text-6xl font-black text-[#FF2800] my-6 tabular-nums">{quizScore}/{QUIZ_QUESTIONS.length}</div>
+                      <h2 className="text-3xl font-black text-white mb-2">Quiz Complete</h2>
                       <p className="text-slate-500 text-sm mb-8">
-                        {quizScore === QUIZ_QUESTIONS.length ? 'Perfect score — full compliance.' : quizScore >= QUIZ_QUESTIONS.length / 2 ? 'Good result. Review flagged rules.' : 'Needs work. Study the rulebook carefully.'}
+                        {quizScore === QUIZ_QUESTIONS.length ? '✓ Perfect score — full compliance.' : quizScore >= QUIZ_QUESTIONS.length / 2 ? 'Good result. Review flagged rules.' : 'Needs work. Study the rulebook carefully.'}
                       </p>
-                      <button
-                        onClick={() => { setQIndex(0); setQuizFinished(false); setQuizScore(0); setSelectedAns(null); setIsAnsChecked(false); }}
-                        className="px-8 py-3 bg-white/10 hover:bg-white/20 text-white font-bold uppercase tracking-widest transition-colors"
-                      >
-                        RESTART QUIZ
-                      </button>
+                      <div className="flex gap-3 justify-center">
+                        <button
+                          onClick={() => { setQIndex(0); setQuizFinished(false); setQuizScore(0); setSelectedAns(null); setIsAnsChecked(false); setScoreCounted(false); }}
+                          className="px-8 py-3 bg-[#FF2800] hover:bg-[#FF4000] text-white font-bold uppercase tracking-widest transition-colors"
+                        >
+                          Restart Quiz
+                        </button>
+                        <button
+                          onClick={() => setAppMode('ask')}
+                          className="px-8 py-3 bg-white/10 hover:bg-white/20 text-white font-bold uppercase tracking-widest transition-colors"
+                        >
+                          Back to Query
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -915,37 +1076,44 @@ export default function IndraWorkspace() {
                   <span className="text-[9px] font-black text-[#FF2800] uppercase tracking-wider">Live Render</span>
                   {highlightMeshes.length > 0 && (
                     <span className="text-[8px] text-slate-500 ml-1">
-                      {highlightMeshes.length} parts · {contextMeshes.length} context
+                      {highlightMeshes.length} parts · {contextMeshes.length} ctx
                     </span>
                   )}
                 </div>
                 <div className="flex items-center gap-2 pointer-events-auto">
-                  <button onClick={() => setShowDebug(!showDebug)} className={`px-2 py-1.5 text-[9px] font-black uppercase rounded transition-colors ${showDebug ? 'bg-[#FF2800] text-white' : 'bg-black/80 text-slate-400 hover:text-white'}`}>
+                  <button
+                    onClick={() => setShowDebug(!showDebug)}
+                    className={`px-2 py-1.5 text-[9px] font-black uppercase rounded transition-colors ${showDebug ? 'bg-[#FF2800] text-white' : 'bg-black/80 text-slate-400 hover:text-white'}`}
+                  >
                     Debug
                   </button>
-                  {/* PATCH 4 — toggle to show/hide the bottom info panel */}
                   <button
                     onClick={() => setShowModelInfo(v => !v)}
-                    title={showModelInfo ? 'Hide panel info' : 'Show panel info'}
+                    title={showModelInfo ? 'Hide info panel' : 'Show info panel'}
                     className="p-2.5 bg-black/80 hover:bg-black text-slate-400 hover:text-white rounded-lg transition-colors"
                   >
                     {showModelInfo ? <EyeOff size={14} /> : <Eye size={14} />}
                   </button>
                   <FocusButton panel="3d" focusedPanel={focusedPanel} onToggle={toggleFocus} />
-                  <button onClick={() => setIs3DFullscreen(!is3DFullscreen)} className="p-2.5 bg-black/80 hover:bg-black text-white rounded-lg transition-colors"><Maximize2 size={14} /></button>
-                  <button onClick={close3DModel} className="p-2.5 bg-[#FF2800] hover:bg-[#FF2800]/80 text-white rounded-lg transition-colors"><X size={14} /></button>
+                  <button onClick={() => setIs3DFullscreen(!is3DFullscreen)} className="p-2.5 bg-black/80 hover:bg-black text-white rounded-lg transition-colors">
+                    <Maximize2 size={14} />
+                  </button>
+                  <button onClick={close3DModel} className="p-2.5 bg-[#FF2800] hover:bg-[#FF2800]/80 text-white rounded-lg transition-colors">
+                    <X size={14} />
+                  </button>
                 </div>
               </div>
 
               {/* Debug Panel */}
               {showDebug && (
                 <div className="absolute top-14 right-3 z-40 bg-black/95 border border-[#FF2800]/40 p-4 max-w-xs text-[9px] font-mono text-slate-300 rounded-lg shadow-2xl overflow-y-auto max-h-[40%] pointer-events-auto">
-                  <h4 className="text-[#FF2800] mb-2 font-black uppercase tracking-widest border-b border-[#FF2800]/30 pb-1">CAD Node Inspector</h4>
+                  <h4 className="text-[#FF2800] mb-2 font-black uppercase tracking-widest border-b border-[#FF2800]/30 pb-1">CAD Inspector</h4>
                   <div className="mb-1"><strong className="text-white">Isolated:</strong> <span className="text-[#FF2800] ml-1">{isolatedParts.length > 0 ? isolatedParts.join(', ') : 'None (all highlights)'}</span></div>
                   <div className="mb-1"><strong className="text-white">Highlights:</strong> <span className="text-orange-400 ml-1">{highlightMeshes.join(', ') || 'None'}</span></div>
                   <div className="mb-2"><strong className="text-white">Context:</strong> <span className="text-slate-400 ml-1">{contextMeshes.join(', ') || 'None'}</span></div>
-                  <div><strong className="text-white">GLB Materials:</strong></div>
-                  <ul className="mt-1 space-y-1">
+                  <div className="mb-1"><strong className="text-white">Progress:</strong> <span className="text-green-400 ml-1">{modelLoadProgress}%</span></div>
+                  <div><strong className="text-white">GLB Materials ({modelParts.length}):</strong></div>
+                  <ul className="mt-1 space-y-1 max-h-32 overflow-y-auto">
                     {modelParts.map((mat, i) => (
                       <li key={i} className={`pl-2 border-l ${matchesMeshName(mat, highlightMeshes) ? 'border-orange-500 text-orange-400' : matchesMeshName(mat, contextMeshes) ? 'border-slate-500 text-slate-400' : 'border-slate-700 text-slate-600'}`}>
                         {mat}
@@ -966,7 +1134,7 @@ export default function IndraWorkspace() {
                 />
               </div>
 
-              {/* PATCH 5 — progress bar pinned to the bottom of the 3D canvas */}
+              {/* BUG 4 FIX: Progress bar driven by real model-viewer 'progress' event */}
               {isModelLoading && (
                 <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none">
                   <div className="h-[2px] bg-white/5">
@@ -984,17 +1152,16 @@ export default function IndraWorkspace() {
               {/* Bottom Info / Part Controls */}
               {showModelInfo && activeModelMetadata && !isModelLoading && (
                 <div className="absolute bottom-3 left-3 right-3 z-30 bg-black/95 backdrop-blur-md border border-white/[0.08] p-4 rounded-xl shadow-2xl max-h-[55%] overflow-y-auto">
-
                   <div className="flex items-center justify-between mb-3">
                     <div>
                       <h3 className="text-base font-black text-white">{activeModelMetadata.name}</h3>
                       {highlightMeshes.length > 0 && (
                         <p className="text-[9px] text-[#FF2800]/70 mt-0.5 uppercase tracking-wider">
-                          {highlightMeshes.length} relevant part{highlightMeshes.length > 1 ? 's' : ''} highlighted
+                          {highlightMeshes.length} part{highlightMeshes.length > 1 ? 's' : ''} highlighted
                         </p>
                       )}
                     </div>
-                    <button onClick={clearIsolation} className="flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-white">
+                    <button onClick={clearIsolation} className="flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-white transition-colors">
                       <RefreshCw size={13} /> Reset
                     </button>
                   </div>
@@ -1002,13 +1169,13 @@ export default function IndraWorkspace() {
                   <div className="flex flex-wrap items-center gap-2 mb-4">
                     <button
                       onClick={() => setIsolationMode(m => m === 'ghost' ? 'hidden' : 'ghost')}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${isolationMode === 'hidden' ? 'bg-red-500/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400'}`}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${isolationMode === 'hidden' ? 'bg-red-500/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400 hover:border-white/40'}`}
                     >
                       {isolationMode === 'hidden' ? <><EyeOff size={10} /> HIDDEN</> : <><Eye size={10} /> GHOSTED</>}
                     </button>
                     <button
                       onClick={() => setHighlightSelected(h => !h)}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${highlightSelected ? 'bg-[#FF2800]/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400'}`}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${highlightSelected ? 'bg-[#FF2800]/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400 hover:border-white/40'}`}
                     >
                       {highlightSelected ? 'HIGHLIGHT ON' : 'HIGHLIGHT OFF'}
                     </button>
@@ -1058,14 +1225,25 @@ export default function IndraWorkspace() {
 
                   <div className="flex items-center justify-between pt-3 border-t border-white/[0.06]">
                     <div className="flex gap-2">
-                      <button onClick={() => setAutoRotateEnabled(!autoRotateEnabled)} className={`p-2.5 rounded-lg transition-colors ${autoRotateEnabled ? 'bg-[#FF2800]/20 text-[#FF2800]' : 'bg-white/5 text-slate-400 hover:text-white'}`}><Play size={15} /></button>
-                      <button onClick={reset3DCamera} className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><RotateCw size={15} /></button>
+                      <button
+                        onClick={() => setAutoRotateEnabled(!autoRotateEnabled)}
+                        title={autoRotateEnabled ? 'Pause rotation' : 'Start rotation'}
+                        className={`p-2.5 rounded-lg transition-colors ${autoRotateEnabled ? 'bg-[#FF2800]/20 text-[#FF2800]' : 'bg-white/5 text-slate-400 hover:text-white'}`}
+                      >
+                        <Play size={15} />
+                      </button>
+                      <button onClick={reset3DCamera} title="Reset camera" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors">
+                        <RotateCw size={15} />
+                      </button>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button onClick={zoomOut} className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomOut size={15} /></button>
-                      <button onClick={zoomIn} className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomIn size={15} /></button>
+                      <button onClick={zoomOut} title="Zoom out" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomOut size={15} /></button>
+                      <button onClick={zoomIn} title="Zoom in" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomIn size={15} /></button>
                     </div>
-                    <button onClick={downloadModel} className="flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-[9px] font-black tracking-widest text-slate-300 hover:text-white transition-colors">
+                    <button
+                      onClick={downloadModel}
+                      className="flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-[9px] font-black tracking-widest text-slate-300 hover:text-white transition-colors"
+                    >
                       <Download size={13} /> DOWNLOAD
                     </button>
                   </div>
