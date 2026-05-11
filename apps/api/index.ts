@@ -36,6 +36,7 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 export const VALID_DOMAINS = [
   'Chassis', 'Braking', 'Powertrain', 'Safety',
   'Aerodynamics', 'Electrical', 'General',
+  'Formula Bharat 2027 Full',
 ] as const;
 type ValidDomain = typeof VALID_DOMAINS[number];
 
