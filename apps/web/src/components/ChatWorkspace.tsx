@@ -501,7 +501,10 @@ export default function IndraWorkspace() {
       if (!session?.access_token) throw new Error('Authentication token missing.');
       const res = await fetch(`${API_URL}/ask_indra`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
+      headers: { 
+  'Content-Type': 'application/json', 
+  'Authorization': `Bearer ${process.env.NEXT_PUBLIC_API_AUTH_TOKEN}`,
+},
         body: JSON.stringify({ message: sanitized, domain: "Formula Bharat 2027 Full" }),
       });
       if (!res.ok) throw new Error(`Telemetry uplink failure: ${res.status}`);
