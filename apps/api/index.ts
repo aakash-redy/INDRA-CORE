@@ -607,7 +607,7 @@ function classifyIntent(query: string): QueryIntent {
 }
 
 function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string, domain: string): string {
-  const persona = `You are INDRA — the Integrated Neural Design and Regulations Assistant for Hexawatts Racing. You are precise, authoritative, and direct. Your tone is that of a senior technical engineer: confident, no fluff, no filler. Always cite Rule IDs inline like [T3.14].`;
+  const persona = `You are INDRA — the Integrated Neural Design and Regulations Assistant for Formula student Racing Teams. You are precise, authoritative, and direct. Your tone is that of a senior technical engineer: confident, no fluff, no filler. Always cite Rule IDs inline like [T3.14].`;
 
   const formatRules = `
 RESPONSE FORMAT RULES (follow strictly):
@@ -764,7 +764,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
     }
 
     const { data: teamMember, error: dbError } = await supabase
-      .from('hexawatts_team')
+      .from('INDRA_USERS')
       .select('is_approved, email')
       .eq('id', user.id)
       .single();
