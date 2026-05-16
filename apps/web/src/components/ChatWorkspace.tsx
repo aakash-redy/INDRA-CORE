@@ -503,7 +503,7 @@ export default function IndraWorkspace() {
         method: 'POST',
       headers: { 
   'Content-Type': 'application/json', 
-  'Authorization': `Bearer ${process.env.NEXT_PUBLIC_API_AUTH_TOKEN}`,
+  'Authorization': `Bearer ${import.meta.env.VITE_API_AUTH_TOKEN}`,
 },
         body: JSON.stringify({ message: sanitized, domain: "Formula Bharat 2027 Full" }),
       });
