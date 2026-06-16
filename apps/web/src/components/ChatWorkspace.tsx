@@ -1,14 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import {
-  Send, ShieldCheck, Trash2, Copy,Plus,
+  Send, ShieldCheck, Trash2, Copy, Plus,
   MessageSquare, BrainCircuit, CheckCircle2, XCircle,
-  ChevronRight, Menu, X, LogOut,
+  ChevronRight, Menu, X,
   Box, Maximize2, Download, ZoomIn, ZoomOut, RotateCw,
   Eye, EyeOff, Play,
   Target, Activity, Zap, Loader2, Ruler,
   Crosshair, Minimize2, Layers, RefreshCw, AlertCircle
 } from "lucide-react";
-import { createClient, Session } from '@supabase/supabase-js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPE DECLARATIONS
@@ -43,11 +42,10 @@ declare global {
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
-const getEnvVar = (key: string, fallback = '') => import.meta.env[key] || fallback;
+const getEnvVar = (key: string, fallback = '') => (import.meta as any).env?.[key] || fallback;
 const API_URL = getEnvVar('VITE_API_URL', 'http://localhost:8000');
 const MAX_MESSAGE_LENGTH = 1000;
 const RATE_LIMIT_DELAY = 1000;
-const supabase = createClient(getEnvVar('VITE_SUPABASE_URL'), getEnvVar('VITE_SUPABASE_ANON_KEY'));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -74,7 +72,6 @@ interface Message {
   context_meshes?: string[];
   timestamp: number;
 }
-interface AuthMessage { type: 'error' | 'success'; text: string; }
 interface QuizQuestion { question: string; options: string[]; correctAnswer: number; explanation: string; }
 type FocusedPanel = null | 'sidebar' | 'chat' | '3d';
 type IsolationMode = 'ghost' | 'hidden';
@@ -186,9 +183,10 @@ function TelemetryStrip() {
   );
 }
 
-function Scanlines() { return <div className="pointer-events-none absolute inset-0 z-0 opacity-[0.025]" style={{ backgroundImage: 'repeating-linear-gradient(to bottom, transparent, transparent 2px, rgba(255,255,255,0.4) 2px, rgba(255,255,255,0.4) 4px)' }} />; }
+function Scanlines() {
+  return <div className="pointer-events-none absolute inset-0 z-0 opacity-[0.025]" style={{ backgroundImage: 'repeating-linear-gradient(to bottom, transparent, transparent 2px, rgba(255,255,255,0.4) 2px, rgba(255,255,255,0.4) 4px)' }} />;
+}
 
-// ── Toast notification ──
 function Toast({ message, type, onClose }: { message: string; type: 'error' | 'success'; onClose: () => void }) {
   useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
   return (
@@ -221,17 +219,9 @@ function matchesMeshName(matName: string, targets: string[]): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN APPLICATION
+// MAIN APPLICATION — NO AUTH GATE
 // ─────────────────────────────────────────────────────────────────────────────
 export default function IndraWorkspace() {
-  // Auth State
-  const [session, setSession] = useState<Session | null>(null);
-  const [isAuthLoading, setIsAuthLoading] = useState(false);
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [isSignUp, setIsSignUp] = useState(false);
-  const [authMessage, setAuthMessage] = useState<AuthMessage | null>(null);
-
   // App State
   const [appMode, setAppMode] = useState<"ask" | "quiz">("ask");
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -271,7 +261,6 @@ export default function IndraWorkspace() {
   const [isAnsChecked, setIsAnsChecked] = useState(false);
   const [quizScore, setQuizScore] = useState(0);
   const [quizFinished, setQuizFinished] = useState(false);
-  // BUG 5 FIX: track if score was already counted for this question
   const [scoreCounted, setScoreCounted] = useState(false);
 
   // Refs
@@ -279,16 +268,9 @@ export default function IndraWorkspace() {
   const inputRef = useRef<HTMLInputElement>(null);
   const modelViewerRef = useRef<any>(null);
   const originalMaterialsRef = useRef<Map<string, number[]>>(new Map());
-  // BUG 3 FIX: use a ref for handle3DModelLoad so sendMessage can safely call it before definition
   const handle3DModelLoadRef = useRef<Function | null>(null);
 
   // ── Effects ──
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => subscription.unsubscribe();
-  }, []);
-
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, isThinking]);
 
   useEffect(() => {
@@ -313,7 +295,7 @@ export default function IndraWorkspace() {
       const matName = mat.name || `Unnamed_Material_${index}`;
       mat.name = matName;
       const original = originalMaterialsRef.current.get(matName) ?? [0.7, 0.7, 0.7, 1.0];
-      const isActive  = matchesMeshName(matName, activeTargets);
+      const isActive = matchesMeshName(matName, activeTargets);
       const isSibling = matchesMeshName(matName, siblingTargets);
       const isContext = matchesMeshName(matName, contextMeshes);
 
@@ -357,9 +339,6 @@ export default function IndraWorkspace() {
     if (activeModelUrl) applyMeshStates();
   }, [isolatedParts, highlightSelected, highlightMeshes, contextMeshes, isolationMode, applyMeshStates, activeModelUrl]);
 
-  // BUG 2 FIX: Stable effect — applyMeshStates is called directly inside the handler
-  // so it doesn't need to be in the dep array. The cleanup correctly removes the exact
-  // same handler function references that were added.
   useEffect(() => {
     const mv = modelViewerRef.current;
     if (!mv) return;
@@ -381,7 +360,6 @@ export default function IndraWorkspace() {
       applyMeshStates();
     };
 
-    // BUG 4 FIX: Use model-viewer's real 'progress' event instead of fake setInterval
     const handleProgress = (e: any) => {
       const pct = Math.round((e.detail?.totalProgress ?? 0) * 100);
       setModelLoadProgress(pct);
@@ -398,8 +376,8 @@ export default function IndraWorkspace() {
       mv.removeEventListener('scene-graph-ready', handleModelReady);
       mv.removeEventListener('progress', handleProgress);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeModelUrl]); // applyMeshStates intentionally excluded — called directly inside handler
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeModelUrl]);
 
   useEffect(() => {
     if (activeModelUrl) {
@@ -408,38 +386,6 @@ export default function IndraWorkspace() {
       setIsolatedParts([]);
     }
   }, [activeModelUrl]);
-
-  // ── Auth ──
-  // Minor fix: wrapped in useCallback for consistency
-  const handleAuthSubmit = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsAuthLoading(true);
-    setAuthMessage(null);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail)) {
-      setAuthMessage({ type: 'error', text: 'Invalid email address' });
-      setIsAuthLoading(false);
-      return;
-    }
-    if (authPassword.length < 6) {
-      setAuthMessage({ type: 'error', text: 'Password must be ≥ 6 characters' });
-      setIsAuthLoading(false);
-      return;
-    }
-    try {
-      if (isSignUp) {
-        const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
-        if (error) throw error;
-        setAuthMessage({ type: 'success', text: 'Access request submitted.' });
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
-        if (error) throw error;
-      }
-    } catch (err: any) {
-      setAuthMessage({ type: 'error', text: err.message || 'Authentication failed.' });
-    } finally {
-      setIsAuthLoading(false);
-    }
-  }, [authEmail, authPassword, isSignUp]);
 
   const copyToClipboard = useCallback(async (text: string, id: string) => {
     try {
@@ -451,7 +397,6 @@ export default function IndraWorkspace() {
     }
   }, [showToast]);
 
-  // BUG 3 FIX: define handle3DModelLoad BEFORE sendMessage, and also assign to ref
   const handle3DModelLoad = useCallback((
     url: string,
     meta?: ModelMetadata,
@@ -469,10 +414,8 @@ export default function IndraWorkspace() {
     setModelParts([]);
     setIsModelLoading(true);
     setModelLoadProgress(0);
-    // BUG 4 FIX: No fake setInterval — real progress comes from model-viewer 'progress' event in useEffect
   }, []);
 
-  // Keep ref in sync so sendMessage can call it safely
   useEffect(() => { handle3DModelLoadRef.current = handle3DModelLoad; }, [handle3DModelLoad]);
 
   // ── Send Message ──
@@ -486,7 +429,6 @@ export default function IndraWorkspace() {
     setInput("");
     setIsThinking(true);
 
-    // BUG 1 FIX: Only reset 3D state if a model is not currently loading
     if (!isModelLoading) {
       setActiveModelUrl(null);
       setActiveModelMetadata(null);
@@ -498,13 +440,12 @@ export default function IndraWorkspace() {
     }
 
     try {
-      if (!session?.access_token) throw new Error('Authentication token missing.');
       const res = await fetch(`${API_URL}/ask_indra`, {
         method: 'POST',
-      headers: { 
-  'Content-Type': 'application/json', 
-  'Authorization': `Bearer ${import.meta.env.VITE_API_AUTH_TOKEN}`,
-},
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${getEnvVar('VITE_API_AUTH_TOKEN')}`,
+        },
         body: JSON.stringify({ message: sanitized, domain: "Formula Bharat 2027 Full" }),
       });
       if (!res.ok) throw new Error(`Telemetry uplink failure: ${res.status}`);
@@ -539,7 +480,7 @@ export default function IndraWorkspace() {
       setIsThinking(false);
       inputRef.current?.focus();
     }
-  }, [isThinking, lastMessageTime, session, isModelLoading, showToast]);
+  }, [isThinking, lastMessageTime, isModelLoading, showToast]);
 
   const close3DModel = useCallback(() => {
     setActiveModelUrl(null);
@@ -581,7 +522,7 @@ export default function IndraWorkspace() {
     }
   }, [activeModelUrl, activeModelMetadata, showToast]);
 
-  const zoomIn  = useCallback(() => modelViewerRef.current?.zoom(-1), []);
+  const zoomIn = useCallback(() => modelViewerRef.current?.zoom(-1), []);
   const zoomOut = useCallback(() => modelViewerRef.current?.zoom(1), []);
   const reset3DCamera = useCallback(() => modelViewerRef.current?.resetTurntableRotation(), []);
 
@@ -605,88 +546,7 @@ export default function IndraWorkspace() {
   }, []);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // LOGIN SCREEN
-  // ─────────────────────────────────────────────────────────────────────────────
-  if (!session) {
-    return (
-      <div className="relative flex min-h-screen items-center justify-center bg-[#060606] overflow-hidden" style={{ fontFamily: "'Rajdhani', 'DIN Next', system-ui, sans-serif" }}>
-        <div className="absolute inset-0 opacity-[0.04]" style={{ backgroundImage: 'linear-gradient(rgba(255,40,0,0.6) 1px, transparent 1px), linear-gradient(90deg, rgba(255,40,0,0.6) 1px, transparent 1px)', backgroundSize: '60px 60px' }} />
-
-        {/* Animated accent lines */}
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-px h-32 bg-gradient-to-b from-transparent to-[#FF2800]/40" />
-        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-px h-32 bg-gradient-to-t from-transparent to-[#FF2800]/40" />
-
-        <div className="relative z-10 w-full max-w-[420px] px-4">
-          <div className="text-center mb-10">
-            {/* Logo mark */}
-            <div className="inline-flex items-center justify-center w-14 h-14 border border-[#FF2800]/30 mb-6 relative">
-              <Zap size={22} className="text-[#FF2800]" />
-              <span className="absolute inset-0 border border-[#FF2800]/10 scale-110" />
-            </div>
-            <h1 className="text-5xl font-black text-white tracking-tighter">INDRA</h1>
-            <p className="text-[#FF2800] text-sm font-bold tracking-[0.25em] mt-1">FORMULA BHARAT 2027</p>
-            <p className="text-slate-600 text-xs mt-3 tracking-widest uppercase">Regulation Intelligence System</p>
-          </div>
-
-          <form onSubmit={handleAuthSubmit} className="space-y-3 bg-[#0c0c0c] border border-white/[0.06] p-8">
-            <div className="relative">
-              <input
-                type="email"
-                required
-                value={authEmail}
-                onChange={e => setAuthEmail(e.target.value)}
-                className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none transition-colors peer"
-                placeholder=" "
-                id="auth-email"
-              />
-              <label htmlFor="auth-email" className="absolute left-4 top-3 text-slate-600 text-sm pointer-events-none transition-all peer-focus:-top-2.5 peer-focus:text-[10px] peer-focus:text-[#FF2800]/70 peer-[:not(:placeholder-shown)]:-top-2.5 peer-[:not(:placeholder-shown)]:text-[10px] bg-[#111] px-1">Email</label>
-            </div>
-            <div className="relative">
-              <input
-                type="password"
-                required
-                value={authPassword}
-                onChange={e => setAuthPassword(e.target.value)}
-                className="w-full bg-[#111] border border-white/[0.07] px-4 py-3 text-white focus:border-[#FF2800]/40 outline-none transition-colors peer"
-                placeholder=" "
-                id="auth-password"
-              />
-              <label htmlFor="auth-password" className="absolute left-4 top-3 text-slate-600 text-sm pointer-events-none transition-all peer-focus:-top-2.5 peer-focus:text-[10px] peer-focus:text-[#FF2800]/70 peer-[:not(:placeholder-shown)]:-top-2.5 peer-[:not(:placeholder-shown)]:text-[10px] bg-[#111] px-1">Password</label>
-            </div>
-
-            {authMessage && (
-              <div className={`flex items-center gap-2 text-xs font-bold p-3 ${authMessage.type === 'success' ? 'bg-green-900/30 text-green-400 border border-green-800/30' : 'bg-red-900/30 text-red-400 border border-red-800/30'}`}>
-                {authMessage.type === 'error' ? <AlertCircle size={13} /> : <CheckCircle2 size={13} />}
-                {authMessage.text}
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={isAuthLoading}
-              className="relative w-full py-4 bg-[#FF2800] text-white font-black text-[11px] tracking-[0.3em] uppercase hover:bg-[#FF4000] transition-colors overflow-hidden group disabled:opacity-60"
-            >
-              <span className="absolute inset-0 bg-white/10 translate-x-[-110%] group-hover:translate-x-[110%] transition-transform duration-500 skew-x-12" />
-              {isAuthLoading ? (
-                <span className="flex items-center justify-center gap-2"><Loader2 size={14} className="animate-spin" /> AUTHENTICATING...</span>
-              ) : isSignUp ? "CREATE ACCOUNT" : "LAUNCH INDRA"}
-            </button>
-
-            <div className="text-center pt-1">
-              <button type="button" onClick={() => { setIsSignUp(!isSignUp); setAuthMessage(null); }} className="text-slate-500 text-xs hover:text-slate-300 transition-colors">
-                {isSignUp ? "Already have access? Sign in" : "Request new access →"}
-              </button>
-            </div>
-          </form>
-
-          <p className="text-center text-slate-700 text-[10px] mt-6 tracking-widest uppercase">Authorized personnel only</p>
-        </div>
-      </div>
-    );
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // MAIN WORKSPACE
+  // MAIN WORKSPACE (always rendered — no auth gate)
   // ─────────────────────────────────────────────────────────────────────────────
   return (
     <div className="flex h-[100dvh] w-full overflow-hidden bg-[#060606] text-slate-200 relative select-none" style={{ fontFamily: "'Rajdhani', 'DIN Next', system-ui, sans-serif" }}>
@@ -702,7 +562,6 @@ export default function IndraWorkspace() {
         </div>
       )}
 
-      {/* Toast */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
       {isSidebarOpen && <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[45] md:hidden" onClick={() => setIsSidebarOpen(false)} />}
@@ -710,17 +569,29 @@ export default function IndraWorkspace() {
       {/* ─── SIDEBAR ─────────────────────────────────────────────────────────── */}
       <PanelShell id="sidebar" focusedPanel={focusedPanel} className={`fixed inset-y-0 left-0 z-50 w-[280px] md:w-[260px] h-full md:relative md:translate-x-0 transition-transform duration-300 ease-out ${isSidebarOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}`}>
         <aside className="flex flex-col h-full bg-[#080808] border-r border-white/[0.05]">
-          <div className="px-6 pt-6 pb-5 border-b border-white/[0.05] flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <Zap size={16} className="text-[#FF2800]" />
-                <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-[#FF2800] rounded-full animate-pulse" />
+          {/* Logo */}
+          <div className="px-6 pt-6 pb-5 border-b border-white/[0.05]">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className="relative flex items-center justify-center w-8 h-8 border border-[#FF2800]/30">
+                  <Zap size={14} className="text-[#FF2800]" />
+                  <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-[#FF2800] rounded-full animate-pulse" />
+                </div>
+                <div>
+                  <div className="text-[13px] font-black text-white tracking-wider leading-none">INDRA</div>
+                  <div className="text-[8px] text-[#FF2800]/60 tracking-[0.2em] uppercase mt-0.5">Formula Bharat 2027</div>
+                </div>
               </div>
-              <div className="text-[11px] font-black text-white tracking-wider">INDRA OS</div>
+              <div className="flex items-center gap-2">
+                <FocusButton panel="sidebar" focusedPanel={focusedPanel} onToggle={toggleFocus} />
+                <button onClick={() => setIsSidebarOpen(false)} className="md:hidden p-2 text-slate-500"><X size={18} /></button>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <FocusButton panel="sidebar" focusedPanel={focusedPanel} onToggle={toggleFocus} />
-              <button onClick={() => setIsSidebarOpen(false)} className="md:hidden p-2 text-slate-500"><X size={18} /></button>
+
+            {/* Status badge */}
+            <div className="flex items-center gap-2 px-3 py-2 bg-[#FF2800]/5 border border-[#FF2800]/10">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#FF2800] animate-pulse shrink-0" />
+              <span className="text-[8px] font-bold text-[#FF2800]/70 uppercase tracking-[0.2em]">System Online</span>
             </div>
           </div>
 
@@ -753,16 +624,10 @@ export default function IndraWorkspace() {
             </button>
           </div>
 
-          {/* Session info */}
+          {/* Bottom info strip */}
           <div className="px-6 py-4 border-t border-white/[0.05]">
-            <p className="text-[8px] text-slate-700 uppercase tracking-widest mb-2">Session</p>
-            <p className="text-[9px] text-slate-500 truncate mb-3">{session.user?.email}</p>
-            <button
-              onClick={() => supabase.auth.signOut()}
-              className="flex items-center gap-2 text-[9px] text-slate-600 hover:text-[#FF2800] uppercase tracking-widest transition-colors"
-            >
-              <LogOut size={11} /> Sign Out
-            </button>
+            <p className="text-[8px] text-slate-700 uppercase tracking-widest mb-1">Build</p>
+            <p className="text-[9px] text-slate-600 font-mono">v2.0.0 · FB2027</p>
           </div>
         </aside>
       </PanelShell>
@@ -807,12 +672,25 @@ export default function IndraWorkspace() {
                 <div className="flex-1 overflow-y-auto px-4 md:px-6 py-4 scroll-smooth">
                   {messages.length === 0 && !isThinking ? (
                     <div className="h-full flex flex-col items-center justify-center max-w-xl mx-auto text-center">
-                      <div className="relative mb-6">
-                        <Target size={28} className="text-[#FF2800]/70" />
-                        <div className="absolute inset-0 blur-xl bg-[#FF2800]/20 rounded-full" />
+                      {/* Hero mark */}
+                      <div className="relative mb-8">
+                        <div className="w-20 h-20 border border-[#FF2800]/20 flex items-center justify-center relative">
+                          <div className="absolute inset-0 border border-[#FF2800]/10 scale-110" />
+                          <div className="absolute inset-0 border border-[#FF2800]/5 scale-125" />
+                          <Zap size={28} className="text-[#FF2800]/80" />
+                          <div className="absolute inset-0 blur-2xl bg-[#FF2800]/10 rounded-full" />
+                        </div>
+                        {/* Corner accents */}
+                        <span className="absolute -top-px -left-px w-3 h-px bg-[#FF2800]/60" />
+                        <span className="absolute -top-px -left-px w-px h-3 bg-[#FF2800]/60" />
+                        <span className="absolute -bottom-px -right-px w-3 h-px bg-[#FF2800]/60" />
+                        <span className="absolute -bottom-px -right-px w-px h-3 bg-[#FF2800]/60" />
                       </div>
-                      <h2 className="text-xl md:text-2xl font-black tracking-tight text-white mb-2 uppercase">Ready for Input</h2>
-                      <p className="text-slate-600 text-xs mb-8 tracking-wider">Ask anything about Formula Bharat 2027 regulations</p>
+
+                      <h2 className="text-2xl md:text-3xl font-black tracking-tight text-white mb-1 uppercase">INDRA Online</h2>
+                      <p className="text-[#FF2800]/50 text-[9px] font-bold tracking-[0.3em] uppercase mb-3">Regulation Intelligence · Formula Bharat 2027</p>
+                      <p className="text-slate-600 text-xs mb-10 tracking-wide max-w-xs">Query any technical regulation, compliance rule, or structural requirement from the FB2027 rulebook.</p>
+
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
                         {QUICK_QUERIES.map((q, i) => (
                           <button
@@ -825,6 +703,13 @@ export default function IndraWorkspace() {
                             <ChevronRight size={9} className="ml-auto text-slate-700 group-hover:text-[#FF2800]/50 transition-colors" />
                           </button>
                         ))}
+                      </div>
+
+                      {/* Divider with label */}
+                      <div className="flex items-center gap-3 w-full mt-8 mb-0">
+                        <div className="flex-1 h-px bg-white/[0.04]" />
+                        <span className="text-[8px] text-slate-700 uppercase tracking-[0.3em]">or type below</span>
+                        <div className="flex-1 h-px bg-white/[0.04]" />
                       </div>
                     </div>
                   ) : (
@@ -877,7 +762,6 @@ export default function IndraWorkspace() {
                               </button>
                             )}
 
-                            {/* Timestamp */}
                             <div className="mt-2 text-[8px] text-slate-700 font-mono">
                               {new Date(msg.timestamp).toLocaleTimeString()}
                             </div>
@@ -919,7 +803,6 @@ export default function IndraWorkspace() {
 
                 <div className="shrink-0 px-4 md:px-6 py-4 pb-[env(safe-area-inset-bottom)] bg-[#060606] border-t border-white/[0.04]">
                   <div className="max-w-3xl mx-auto">
-                    {/* Character count */}
                     {input.length > 800 && (
                       <div className="flex justify-end mb-1">
                         <span className={`text-[9px] font-mono ${input.length > 950 ? 'text-[#FF2800]' : 'text-slate-600'}`}>
@@ -958,7 +841,6 @@ export default function IndraWorkspace() {
                 <div className="flex-1 max-w-2xl mx-auto w-full">
                   {!quizFinished ? (
                     <>
-                      {/* Progress bar */}
                       <div className="flex items-center gap-3 mb-6">
                         <div className="flex-1 h-px bg-white/[0.07]">
                           <div
@@ -1013,7 +895,6 @@ export default function IndraWorkspace() {
                       )}
 
                       <button
-                        // BUG 5 FIX: use scoreCounted flag to prevent double-increment
                         onClick={() => {
                           if (selectedAns === null) return;
                           if (!isAnsChecked) {
@@ -1042,8 +923,11 @@ export default function IndraWorkspace() {
                     </>
                   ) : (
                     <div className="text-center py-12">
-                      <div className="text-6xl font-black text-[#FF2800] my-6 tabular-nums">{quizScore}/{QUIZ_QUESTIONS.length}</div>
-                      <h2 className="text-3xl font-black text-white mb-2">Quiz Complete</h2>
+                      {/* Score display */}
+                      <div className="relative inline-block mb-4">
+                        <div className="text-7xl font-black text-[#FF2800] tabular-nums">{quizScore}<span className="text-3xl text-slate-600">/{QUIZ_QUESTIONS.length}</span></div>
+                      </div>
+                      <h2 className="text-3xl font-black text-white mb-2 uppercase">Quiz Complete</h2>
                       <p className="text-slate-500 text-sm mb-8">
                         {quizScore === QUIZ_QUESTIONS.length ? '✓ Perfect score — full compliance.' : quizScore >= QUIZ_QUESTIONS.length / 2 ? 'Good result. Review flagged rules.' : 'Needs work. Study the rulebook carefully.'}
                       </p>
@@ -1052,7 +936,7 @@ export default function IndraWorkspace() {
                           onClick={() => { setQIndex(0); setQuizFinished(false); setQuizScore(0); setSelectedAns(null); setIsAnsChecked(false); setScoreCounted(false); }}
                           className="px-8 py-3 bg-[#FF2800] hover:bg-[#FF4000] text-white font-bold uppercase tracking-widest transition-colors"
                         >
-                          Restart Quiz
+                          Restart
                         </button>
                         <button
                           onClick={() => setAppMode('ask')}
@@ -1072,7 +956,6 @@ export default function IndraWorkspace() {
           {activeModelUrl && (
             <PanelShell id="3d" focusedPanel={focusedPanel} className={`${is3DFullscreen ? 'fixed inset-0 z-[60]' : 'flex h-[45vh] md:h-full w-full md:w-1/2'} flex-col bg-[#070707] relative`}>
 
-              {/* Top Controls */}
               <div className="absolute top-3 left-3 right-3 z-30 flex items-center justify-between pointer-events-none">
                 <div className="bg-black/80 backdrop-blur px-3 py-1.5 flex items-center gap-2 pointer-events-auto border border-[#FF2800]/20 rounded-lg">
                   <span className="w-1.5 h-1.5 bg-[#FF2800] animate-pulse rounded-full" />
@@ -1107,7 +990,6 @@ export default function IndraWorkspace() {
                 </div>
               </div>
 
-              {/* Debug Panel */}
               {showDebug && (
                 <div className="absolute top-14 right-3 z-40 bg-black/95 border border-[#FF2800]/40 p-4 max-w-xs text-[9px] font-mono text-slate-300 rounded-lg shadow-2xl overflow-y-auto max-h-[40%] pointer-events-auto">
                   <h4 className="text-[#FF2800] mb-2 font-black uppercase tracking-widest border-b border-[#FF2800]/30 pb-1">CAD Inspector</h4>
@@ -1126,7 +1008,6 @@ export default function IndraWorkspace() {
                 </div>
               )}
 
-              {/* 3D Canvas */}
               <div className="flex-1 w-full h-full cursor-move">
                 <model-viewer
                   ref={modelViewerRef}
@@ -1137,7 +1018,6 @@ export default function IndraWorkspace() {
                 />
               </div>
 
-              {/* BUG 4 FIX: Progress bar driven by real model-viewer 'progress' event */}
               {isModelLoading && (
                 <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none">
                   <div className="h-[2px] bg-white/5">
@@ -1152,7 +1032,6 @@ export default function IndraWorkspace() {
                 </div>
               )}
 
-              {/* Bottom Info / Part Controls */}
               {showModelInfo && activeModelMetadata && !isModelLoading && (
                 <div className="absolute bottom-3 left-3 right-3 z-30 bg-black/95 backdrop-blur-md border border-white/[0.08] p-4 rounded-xl shadow-2xl max-h-[55%] overflow-y-auto">
                   <div className="flex items-center justify-between mb-3">
