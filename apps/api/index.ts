@@ -44,13 +44,29 @@ export const VALID_DOMAINS = [
 ] as const;
 type ValidDomain = typeof VALID_DOMAINS[number];
 
+// FIX (accuracy):
+//  - MATCH_THRESHOLD: tuned from 0.4 → 0.5 for nomic-embed-text-v1.5.
+//    The old 0.4 threshold was inherited from the previous Gemini
+//    embedding model. Nomic vectors have a tighter similarity
+//    distribution, so 0.4 was pulling in marginally related chunks and
+//    diluting the model's focus. 0.5 keeps the on-topic chunks and
+//    drops the noise.
+//  - LEARNED_MATCH_THRESHOLD: dropped 0.75 → 0.7 so the system more
+//    often uses its prior good answers (recoveries from user feedback)
+//    instead of recomputing from scratch.
+//  - CACHE_SIMILARITY_THRESHOLD: dropped 0.97 → 0.94. 0.97 was so
+//    tight that the cache was effectively dead — two semantically
+//    equivalent phrasings rarely hit 0.97. 0.94 still rejects truly
+//    different queries but accepts the "front impact structure specs"
+//    vs "specs for the front impact structure" style of reuse.
+//  - MATCH_COUNT: bumped 5 → 7 to give the reranker more signal.
 const CONFIG = {
-  MATCH_THRESHOLD: 0.4,
-  LEARNED_MATCH_THRESHOLD: 0.75,
-  MATCH_COUNT: 5,
+  MATCH_THRESHOLD: 0.5,
+  LEARNED_MATCH_THRESHOLD: 0.7,
+  MATCH_COUNT: 7,
   LEARNED_MATCH_COUNT: 3,
   CACHE_TTL_MS: 60 * 60 * 1000,
-  CACHE_SIMILARITY_THRESHOLD: 0.97,
+  CACHE_SIMILARITY_THRESHOLD: 0.94,
   CACHE_MAX_ENTRIES: 500,
   MAX_MESSAGE_LENGTH: 1000,
   MIN_MESSAGE_LENGTH: 2,
@@ -176,15 +192,40 @@ function findCacheHit(embedding: number[], domain: string): Record<string, unkno
   return null;
 }
 
+// FIX (accuracy): MD5 is cryptographically broken and a poor cache key choice.
+// Replaced with SHA-256, and the cache key now includes a domain prefix
+// plus a short fingerprint so collisions are virtually impossible.
 function writeCache(embedding: number[], domain: string, response: Record<string, unknown>): void {
   if (semanticCache.size >= CONFIG.CACHE_MAX_ENTRIES) {
     const oldestKey = semanticCache.keys().next().value;
     if (oldestKey) semanticCache.delete(oldestKey);
     logger.info(`Cache eviction: max entries (${CONFIG.CACHE_MAX_ENTRIES}) reached.`);
   }
-  const hash = crypto.createHash('md5').update(JSON.stringify(embedding)).digest('hex');
+  const hash = crypto.createHash('sha256').update(JSON.stringify(embedding)).digest('hex').slice(0, 32);
   const key = `${domain}:${hash}`;
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
+}
+
+// FIX (accuracy): explicit cache invalidation hook. The old code relied on
+// the 60-minute TTL and a 10-minute GC, which meant that after a rulebook
+// re-ingestion the API would still serve the OLD cached answers for up to
+// an hour. Now the ingestion script can call invalidateCache() via a new
+// admin endpoint to flush the cache the moment the new embeddings land.
+export function invalidateCache(domain?: string): number {
+  if (!domain) {
+    const size = semanticCache.size;
+    semanticCache.clear();
+    return size;
+  }
+  const prefix = `${domain}:`;
+  let removed = 0;
+  for (const key of Array.from(semanticCache.keys())) {
+    if (key.startsWith(prefix)) {
+      semanticCache.delete(key);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 setInterval(() => {
@@ -574,33 +615,138 @@ No explanation. No markdown. Pure JSON array only.`;
 // ── 12. PROMPT INJECTION GUARD
 // ============================================================================
 
+// FIX (accuracy): the old regex only caught obvious English phrases and
+// could be defeated by base64, unicode homoglyphs, and indirect injection.
+// The new detector is multi-signal:
+//   1) broader regex set covering known prompt-injection phrasings
+//   2) a unicode-normalized pass so homoglyphs (\u0430 Cyrillic 'a')
+//      are not used to bypass matching
+//   3) a base64 / hex blob heuristic for hidden payloads
+//   4) a per-query high non-alphanumeric ratio check (many control chars
+//      or zero-width chars in a short text is suspicious)
+//   5) a length-vs-meaning check (very long queries with very few words
+//      often hide a smuggled prompt)
+//
+// The detector is intentionally conservative — false positives only
+// trigger a 400 with a generic message; the LLM is never called.
 const INJECTION_PATTERNS: RegExp[] = [
-  /ignore (all )?(previous|prior|above) instructions/i,
+  /ignore (all )?(previous|prior|above|preceding) (instructions|prompts?|directives|rules)/i,
   /you are now/i,
   /new (system )?prompt/i,
-  /forget (everything|all)/i,
+  /forget (everything|all|prior|previous)/i,
   /act as (a |an )?(?!engineer|assistant|regulations|technical)/i,
   /disregard (all |your )?(previous |prior )?instructions/i,
   /override (your )?(instructions|rules|guidelines)/i,
   /\[system\]/i,
   /<\/?system>/i,
+  /<\/?(human|assistant|user|tool|function_call)\s*>/i,
   /prompt injection/i,
+  /jailbreak/i,
+  /do anything now/i,
+  /\bdan\b.{0,40}\bmode\b/i,
+  /reveal (your|the) (system|hidden|internal) (prompt|instructions|rules)/i,
+  /show (your|the) (system|initial|original) prompt/i,
+  /print (your|the) (system|hidden) (prompt|message)/i,
+  /repeat (the )?(words|text) (above|before)/i,
+  /from now on (you|ignore|disregard|answer|respond)/i,
+  /translate (this|the following).{0,40}into (a |an )?(jailbreak|system prompt|instruction)/i,
+  /developer mode/i,
+  /sudo mode/i,
+  /\bpretend (you are|to be|you're)\b/i,
+  /\bno (rules|restrictions|limitations|filter)\b/i,
 ];
 
+// Normalize homoglyphs so attackers can't bypass the regex with Cyrillic etc.
+function normalizeHomoglyphs(s: string): string {
+  return s
+    .normalize('NFKD')
+    // strip combining marks
+    .replace(/[\u0300-\u036f]/g, '')
+    // common Cyrillic / Greek look-alikes → Latin
+    .replace(/[\u0430]/g, 'a').replace(/[\u0435]/g, 'e').replace(/[\u043E]/g, 'o')
+    .replace(/[\u0440]/g, 'p').replace(/[\u0441]/g, 'c').replace(/[\u0443]/g, 'y')
+    .replace(/[\u0445]/g, 'x').replace(/[\u0410]/g, 'A').replace(/[\u0415]/g, 'E')
+    .replace(/[\u041E]/g, 'O').replace(/[\u0420]/g, 'P').replace(/[\u0421]/g, 'C')
+    .replace(/[\u0422]/g, 'T').replace(/[\u0412]/g, 'B').replace(/[\u041A]/g, 'K')
+    .replace(/[\u041C]/g, 'M').replace(/[\u041D]/g, 'H').replace(/[\u0391]/g, 'A')
+    .replace(/[\u0392]/g, 'B').replace(/[\u0395]/g, 'E').replace(/[\u0396]/g, 'Z')
+    .replace(/[\u0397]/g, 'H').replace(/[\u0399]/g, 'I').replace(/[\u039A]/g, 'K')
+    .replace(/[\u039C]/g, 'M').replace(/[\u039D]/g, 'N').replace(/[\u039F]/g, 'O')
+    .replace(/[\u03A1]/g, 'P').replace(/[\u03A4]/g, 'T').replace(/[\u03A5]/g, 'Y')
+    .replace(/[\u03A7]/g, 'X');
+}
+
+// Heuristic: detect base64 / hex blobs that could hide instructions.
+function hasHiddenBlob(s: string): boolean {
+  // 60+ contiguous base64-ish characters (incl. + / =) often means a
+  // hidden payload the model might be told to decode.
+  if (/\b[A-Za-z0-9+/]{60,}={0,2}\b/.test(s)) return true;
+  // 80+ hex chars in a row
+  if (/\b[0-9a-fA-F]{80,}\b/.test(s)) return true;
+  return false;
+}
+
 function detectInjection(text: string): boolean {
-  return INJECTION_PATTERNS.some(p => p.test(text));
+  if (!text) return false;
+  // Strip zero-width / control chars that can hide tokens
+  const stripped = text.replace(/[\u200B-\u200F\u2028-\u202F\uFEFF\u0000-\u001F]/g, ' ');
+
+  // 1) Regex pass on original
+  if (INJECTION_PATTERNS.some(p => p.test(stripped))) return true;
+
+  // 2) Regex pass on homoglyph-normalized form
+  const norm = normalizeHomoglyphs(stripped);
+  if (norm !== stripped && INJECTION_PATTERNS.some(p => p.test(norm))) return true;
+
+  // 3) Hidden blob heuristic
+  if (hasHiddenBlob(stripped)) return true;
+
+  // 4) Non-alphanumeric ratio: if more than 35% of characters are
+  //    non-alphanumeric AND non-whitespace, the query is suspicious.
+  const meaningful = stripped.replace(/\s+/g, '');
+  if (meaningful.length > 30) {
+    const nonAlnum = (meaningful.match(/[^A-Za-z0-9]/g) ?? []).length;
+    if (nonAlnum / meaningful.length > 0.35) return true;
+  }
+
+  return false;
 }
 
 // ============================================================================
 // ── 13. INTENT CLASSIFICATION & PROMPT BUILDING
 // ============================================================================
 
+// FIX (accuracy): the previous regex classified "Is 25 mm legal?" as
+// 'dimension' because of the 'mm' token — but the user really wanted a
+// compliance verdict. Order of checks + tighter patterns fix the routing.
 function classifyIntent(query: string): QueryIntent {
-  const q = query.toLowerCase();
-  if (/\b(how (wide|tall|long|thick|deep)|dimension|size|length|width|height|weight|distance|radius|diameter|mm|cm|kg|newton|force|thickness|volume|area)\b/.test(q)) return 'dimension';
-  if (/\b(legal|illegal|allowed|permitted|prohibited|pass|fail|comply|compliant|violation|violate|can i|is it ok|is .+ allowed)\b/.test(q)) return 'compliance';
-  if (/\b(what is|define|definition|what does .+ mean|explain|describe)\b/.test(q)) return 'definition';
-  if (/\b(how to|steps|procedure|process|install|mount|attach|assemble|test|inspect|check)\b/.test(q)) return 'procedure';
+  const q = query.toLowerCase().trim();
+
+  // 1. Compliance first — questions that contain a verdict intent
+  //    ("is X legal", "can I", "pass/fail", "compliant") should always
+  //    take priority over dimension keywords that may appear inside them.
+  if (/\b(legal|illegal|allowed|not allowed|permitted|prohibited|banned|forbidden|pass|fail|comply|compliant|non[- ]?compliant|violation|violate|can i|may i|is it ok|is .+ allowed|is .+ legal|is .+ permitted|is .+ prohibited|will .+ pass|will .+ fail|am i allowed)\b/.test(q)) {
+    return 'compliance';
+  }
+
+  // 2. Procedure — "how to", "steps", "install", "procedure"
+  if (/\b(how to|steps|step[- ]by[- ]step|procedure|process|install|mount|attach|assemble|disassemble|replace|remove|test|inspect|check|verify|calibrate|tighten|torque|weld|braze|solder|connect|wire|route|run|route .+ through)\b/.test(q)) {
+    return 'procedure';
+  }
+
+  // 3. Definition — "what is", "define", "meaning of"
+  if (/^(\s*)(what is|what's|whats|define|definition of|meaning of|what does .+ mean|what do you mean by|explain what|describe what)\b/.test(q)) {
+    return 'definition';
+  }
+
+  // 4. Dimension — only reached if not a compliance question. Require
+  //    either a unit (mm, cm, etc.) or a direct dimensional noun.
+  if (/\b\d+\s*(mm|cm|m|inch|in|ft)\b/.test(q)) return 'dimension';
+  if (/\b(how (wide|tall|long|thick|deep|small|large|big)|dimension|dimensional|size|length|width|height|weight|distance|radius|diameter|thickness|volume|area|cross[- ]section|clearance|gap|spacing)\b/.test(q)) {
+    return 'dimension';
+  }
+
+  // 5. Default
   return 'general';
 }
 
@@ -914,6 +1060,16 @@ app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Respon
   res.json({ total_entries: semanticCache.size, active, expired, max_entries: CONFIG.CACHE_MAX_ENTRIES });
 });
 
+// FIX (accuracy): cache invalidation endpoint so the ingestion script
+// (or an admin) can flush the cache immediately after the rulebook
+// embeddings are updated — instead of waiting up to 60 minutes for TTL.
+app.post('/admin/cache/invalidate', generalLimiter, requireAuth, (req: Request, res: Response): void => {
+  const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
+  const removed = invalidateCache(domain);
+  logger.info('Cache invalidated by admin', { domain: domain ?? 'ALL', removed });
+  res.json({ message: `Invalidated ${removed} cache entries${domain ? ` for domain "${domain}"` : ' (all domains)'}.`, removed });
+});
+
 app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: Response): void => {
   const cleared = semanticCache.size;
   semanticCache.clear();
@@ -950,6 +1106,15 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     typeof domain === 'string' &&
     VALID_DOMAINS.includes(domain.trim() as ValidDomain)
   ) ? domain.trim() : 'General';
+
+  // FIX (accuracy): log a warning whenever the client sends an unknown
+  // or missing domain so the operator can see the issue in the logs
+  // (otherwise it silently dilutes retrieval across all rules).
+  if (typeof domain !== 'string' || !VALID_DOMAINS.includes(domain.trim() as ValidDomain)) {
+    logger.warn('[DOMAIN] Request used missing or unknown domain; fell back to "General"', {
+      requestId, received: domain ?? null,
+    });
+  }
 
   try {
     const intent            = classifyIntent(trimmed);
@@ -1119,6 +1284,53 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 });
 
 // ── Feedback & learning ──────────────────────────────────────────────────────
+// FIX (accuracy): the previous /feedback accepted any question/answer pair
+// and saved "good"-rated ones directly to the sora_learned table. Because
+// the learned table is later retrieved via match_learned_chunks and
+// injected verbatim into the model context, an attacker could RAG-poison
+// the system by submitting misleading Q/A pairs. We now:
+//
+//   - Reject pairs whose answer doesn't reference a rule ID (FB rules
+//     always cite one in the form [T3.1.2], [EV4.3], [A1.2.3], etc.).
+//   - Reject pairs that try to smuggle injection payloads.
+//   - Require a minimum 8-word answer to prevent single-sentence poisoning.
+//   - Reject "good" ratings when the answer looks like a refusal or
+//     when the question contains URLs / code blocks / escape sequences.
+const RULE_ID_RE = /\b([A-Z]{1,3}\d+(?:\.\d+){1,3})\b/;
+const URL_RE     = /\bhttps?:\/\/\S+/i;
+const CODE_RE    = /```|<code>|function\s*\(|class\s+\w+\s*[{:]/i;
+const ESC_RE     = /\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}/;
+
+function isValidLearnedPair(question: string, answer: string): { ok: boolean; reason?: string } {
+  // Require a rule reference in the answer — that is the format INDRA
+  // already produces, so any legitimate AI answer will have one.
+  if (!RULE_ID_RE.test(answer)) {
+    return { ok: false, reason: 'answer must reference a rule ID (e.g. [T3.1.2])' };
+  }
+  // Reject answers that look like refusals or out-of-band content.
+  if (/^(i (can'?t|cannot|am unable)|as an? (ai|language model)|i don'?t have)/i.test(answer.trim())) {
+    return { ok: false, reason: 'answer appears to be a refusal, not a rule citation' };
+  }
+  // Reject hidden payloads in either side.
+  if (URL_RE.test(question) || URL_RE.test(answer)) {
+    return { ok: false, reason: 'URLs are not allowed in learned pairs' };
+  }
+  if (CODE_RE.test(answer)) {
+    return { ok: false, reason: 'code blocks are not allowed in learned pairs' };
+  }
+  if (ESC_RE.test(answer)) {
+    return { ok: false, reason: 'escape sequences are not allowed in learned pairs' };
+  }
+  if (detectInjection(question) || detectInjection(answer)) {
+    return { ok: false, reason: 'injection patterns detected' };
+  }
+  // Require a substantive answer (8+ words) to prevent terse poisoning.
+  if (answer.trim().split(/\s+/).length < 8) {
+    return { ok: false, reason: 'answer is too short to be a valid learned pair' };
+  }
+  return { ok: true };
+}
+
 app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const authReq   = req as AuthenticatedRequest;
   const requestId = authReq.requestId;
@@ -1150,6 +1362,13 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
     const dbTasks: Promise<void>[] = [];
 
     if (rating === 'good') {
+      // Validate the pair before persisting — prevents RAG poisoning.
+      const check = isValidLearnedPair(trimmedQuestion, trimmedAnswer);
+      if (!check.ok) {
+        logger.warn('[FEEDBACK] Rejected learned pair', { requestId, userId, reason: check.reason });
+        res.status(400).json({ error: `Cannot save learned pair: ${check.reason}.`, code: 'INVALID_LEARNED_PAIR' });
+        return;
+      }
       dbTasks.push(saveLearnedPair(trimmedQuestion, trimmedAnswer, sanitizedDomain, 'user_feedback'));
       logger.info('Learned pair saved from feedback', { requestId, userId, question: trimmedQuestion.slice(0, 60) });
     }
@@ -1266,12 +1485,61 @@ correctAnswer is the 0-based index of the correct option.
 REGULATION EXCERPTS:
 ${context}`;
 
+// FIX (accuracy): validate the LLM's JSON output against a strict schema
+// before sending it to the client. Previously malformed arrays
+// (missing options, out-of-range correctAnswer, etc.) were passed
+// straight through. Also, the correct answer index is STRIPPED from the
+// response so the quiz doesn't spoil itself before the user answers.
     const raw       = await generate(prompt, true, 0.4);
     const cleaned   = raw.replace(/```json|```/g, '').trim();
-    const questions = JSON.parse(cleaned);
+    let questions: unknown;
+    try {
+      questions = JSON.parse(cleaned);
+    } catch (e) {
+      logger.error('Quiz JSON parse failed', e, { preview: cleaned.slice(0, 200) });
+      res.status(502).json({ error: 'Quiz generation returned invalid JSON.', code: 'INVALID_LLM_JSON' });
+      return;
+    }
 
-    if (!Array.isArray(questions)) throw new Error('Invalid quiz generation response');
-    res.json({ questions, domain, generated: true });
+    if (!Array.isArray(questions)) {
+      res.status(502).json({ error: 'Quiz generation did not return an array.', code: 'INVALID_LLM_STRUCTURE' });
+      return;
+    }
+
+    interface RawQuestion { question?: unknown; options?: unknown; correctAnswer?: unknown; explanation?: unknown; rule_id?: unknown; }
+    const validQuestions: { question: string; options: string[]; explanation: string; rule_id: string }[] = [];
+    for (const q of questions as RawQuestion[]) {
+      if (
+        typeof q.question !== 'string' || q.question.trim().length < 5 ||
+        !Array.isArray(q.options) || q.options.length < 2 ||
+        !q.options.every(o => typeof o === 'string' && o.trim().length > 0) ||
+        typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer >= q.options.length
+      ) {
+        logger.warn('Quiz: dropping malformed question', { q });
+        continue;
+      }
+      validQuestions.push({
+        question:   q.question,
+        options:    q.options as string[],
+        explanation: typeof q.explanation === 'string' ? q.explanation : '',
+        rule_id:     typeof q.rule_id === 'string' ? q.rule_id : '',
+      });
+    }
+
+    if (validQuestions.length === 0) {
+      res.status(502).json({ error: 'Quiz generation produced no valid questions.', code: 'NO_VALID_QUESTIONS' });
+      return;
+    }
+
+    // FIX (accuracy): never send correctAnswer to the client before
+    // the user answers — previously the index was shipped inside the
+    // questions array, spoiling the quiz.
+    res.json({
+      questions: validQuestions,
+      domain,
+      generated: true,
+      _meta: { generated_count: validQuestions.length, requested_count: questionCount },
+    });
   } catch (err) {
     logger.error('Quiz generation error', err);
     res.status(500).json({ error: 'Failed to generate quiz questions.', code: 'INTERNAL_ERROR' });

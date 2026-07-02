@@ -504,11 +504,24 @@ if __name__ == "__main__":
     TARGET_DOMAIN    = "Formula Bharat 2027 Full"
     START_PAGE       = 1
     END_PAGE         = None    # None = entire document
-    WIPE_SLATE_CLEAN = True    # True = wipe Gemini vectors and reingest with Nomic
 
-    logger.info("🚀 INDRA INGESTION ENGINE v8.0 — NOMIC REINGESTION SEQUENCE…")
-    logger.info("⚠️  WIPE_SLATE_CLEAN=True — existing Gemini vectors will be deleted")
-    logger.info("   This is required because Gemini and Nomic vectors are incompatible")
+    # FIX (accuracy/safety): WIPE_SLATE_CLEAN was hardcoded to True,
+    # which meant a single run of this script would delete the entire
+    # rulebook from Supabase and replace it. If the wrong env was
+    # loaded, the operator could wipe production data with no warning.
+    # We now default to False; to re-ingest and replace, the operator
+    # must either set the env variable WIPE_SLATE_CLEAN=1 or pass
+    # --wipe on the command line.
+    import os, sys
+    CLI_WIPE = "--wipe" in sys.argv
+    WIPE_SLATE_CLEAN = CLI_WIPE or os.getenv("WIPE_SLATE_CLEAN", "0") == "1"
+
+    if WIPE_SLATE_CLEAN:
+        logger.warning("🧹 WIPE_SLATE_CLEAN is ENABLED — existing rulebook vectors will be DELETED before re-ingestion.")
+        logger.warning("   Press Ctrl-C within 5 seconds to abort…")
+        time.sleep(5)
+    else:
+        logger.info("♻️  INCREMENTAL MODE — existing rules will be skipped, not deleted (set WIPE_SLATE_CLEAN=1 or pass --wipe to force a full re-ingestion).")
 
     ingest_domain(
         file_path     = ROOT_DIR / "FB2027_Rules.pdf",

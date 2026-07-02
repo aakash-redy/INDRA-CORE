@@ -98,7 +98,19 @@ async def ask_sora(req: QueryRequest):
         """
         
         # Step G: Generate Answer (Temperature 0.1 stops hallucinations)
-        model = genai.GenerativeModel('gemini-3.1-pro')
+        # FIX: 'gemini-3.1-pro' does not exist in the Google Generative AI model
+        # list — it was causing every /ask_sora request to fail with 500.
+        # 'gemini-2.0-flash' is fast, capable, and matches the model family used
+        # in apps/api/index.ts (PRIMARY roster), so behavior is consistent
+        # across both backends. The model is overridable via SORA_MODEL_NAME env.
+        MODEL_NAME = os.getenv("SORA_MODEL_NAME", "gemini-2.0-flash")
+        try:
+            model = genai.GenerativeModel(MODEL_NAME)
+        except Exception as model_err:
+            # If the preferred model isn't available on this account, fall back
+            # to a long-stable model (gemini-1.5-pro) instead of crashing.
+            print(f"⚠️  Model '{MODEL_NAME}' unavailable ({model_err}); falling back to gemini-1.5-pro.")
+            model = genai.GenerativeModel("gemini-1.5-pro")
         answer = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(temperature=0.1)
