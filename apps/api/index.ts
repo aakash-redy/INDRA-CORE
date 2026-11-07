@@ -1035,7 +1035,7 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
 
   const groqRosterStatus = groqRoster.map(s => ({
     label:     s.label,
-    model:     'llama-3.3-70b-versatile',
+    model:     'llama-3.1-8b-instant',
     status:    s.coolUntil > now ? 'cooling' : 'active',
     coolUntil: s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
     quotaHits: s.quotaHits,
@@ -1567,7 +1567,7 @@ app.listen(PORT, () => {
   console.log(`⚠️   Auth         : BYPASSED — all requests accepted as dev@local (admin)`);
   console.log(`⚠️   3D Layer     : PARTIALLY DISCONNECTED — mesh data suppressed in responses`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Injection Guard (still active)`);
-  console.log(`🔑  Groq keys    : ${groqRoster.length} keys (llama-3.3-70b-versatile) — PRIMARY generation`);
+  console.log(`🔑  Groq keys    : ${groqRoster.length} keys (llama-3.1-8b-instant) — PRIMARY generation`);
   console.log(`🔑  Gemini key   : ${primaryRoster.length} models — generation fallback`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models — rerank + last-resort generation`);
   console.log(`🔀  Gen chain    : Groq #1 → Groq #2 → Gemini primary → Gemini rerank key`);
