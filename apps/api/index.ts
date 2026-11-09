@@ -6,7 +6,6 @@ import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
-import Groq from 'groq-sdk';
 import crypto from 'crypto';
 
 dotenv.config();
@@ -22,8 +21,8 @@ const requiredEnvVars = [
   'GEMINI_RERANK_API_KEY',
   'NOMIC_API_KEY',
   // 'API_AUTH_TOKEN',      // AUTH BYPASSED — skipping token check
-  'GROQ_API_KEY_1',
-  'GROQ_API_KEY_2',
+  'OPENROUTER_API_KEY_1',
+  'OPENROUTER_API_KEY_2',
   'COHERE_API_KEY',
 ];
 
@@ -78,6 +77,9 @@ const CONFIG = {
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
 } as const;
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
 
 // ── Supabase client — still used for DB queries (not auth) ──────────────────
 const supabase = createClient(
@@ -155,11 +157,13 @@ interface ModelSlot {
   successCount: number;
 }
 
-interface GroqSlot {
+interface OpenRouterSlot {
   label: string;
-  client: Groq;
+  apiKey: string;
+  modelName: string;
   coolUntil: number;
   quotaHits: number;
+  successCount: number;
 }
 
 // ============================================================================
@@ -381,59 +385,105 @@ async function generateWithRoster(
 }
 
 // ============================================================================
-// ── 8. GROQ ROSTER
+// ── 8. OPENROUTER ROSTER
 // ============================================================================
 
-function buildGroqRoster(): GroqSlot[] {
+function buildOpenRouterRoster(): OpenRouterSlot[] {
   return [
-    process.env.GROQ_API_KEY_1,
-    process.env.GROQ_API_KEY_2,
+    process.env.OPENROUTER_API_KEY_1,
+    process.env.OPENROUTER_API_KEY_2,
   ]
-  .filter(Boolean)
-  .map((key, i) => ({
-    label: `GROQ_KEY_${i + 1}`,
-    client: new Groq({ apiKey: key }),
+  .filter((key): key is string => Boolean(key))
+  .map((apiKey, i) => ({
+    label: `OPENROUTER_KEY_${i + 1}`,
+    apiKey,
+    modelName: OPENROUTER_MODEL,
     coolUntil: 0,
     quotaHits: 0,
+    successCount: 0,
   }));
 }
 
-const groqRoster = buildGroqRoster();
+const openRouterRoster = buildOpenRouterRoster();
 
-async function generateWithGroqRoster(prompt: string, temperature = 0.7): Promise<string> {
+async function generateWithOpenRouterRoster(
+  prompt: string,
+  requireJson = false,
+  temperature = 0.7,
+): Promise<string> {
   const now = Date.now();
-  const active = groqRoster.filter(s => s.coolUntil <= now);
-  const slots = active.length > 0 ? active : groqRoster;
+  const active = openRouterRoster.filter(s => s.coolUntil <= now);
+  const slots = active.length > 0 ? active : openRouterRoster;
 
   for (const slot of slots) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.GEMINI_TIMEOUT_MS);
+
     try {
-      const response = await withTimeout(
-        slot.client.chat.completions.create({
-          model: 'llama-4-scout-17b-16e-instruct',
+      const response = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${slot.apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:8000',
+          'X-Title': process.env.OPENROUTER_APP_NAME || 'INDRA RAG Backend',
+        },
+        body: JSON.stringify({
+          model: slot.modelName,
           messages: [{ role: 'user', content: prompt }],
           temperature,
+          ...(requireJson ? { response_format: { type: 'json_object' } } : {}),
         }),
-        CONFIG.GEMINI_TIMEOUT_MS,
-        slot.label,
-      );
-      logger.info(`[GROQ] ${slot.label} ✓`);
-      return response.choices[0]?.message?.content ?? '';
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`OpenRouter HTTP ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json() as {
+        choices?: { message?: { content?: string } }[];
+      };
+
+      const text = data.choices?.[0]?.message?.content ?? '';
+      slot.successCount++;
+      logger.info(`[OPENROUTER] ${slot.label} ✓ (successes: ${slot.successCount})`);
+      return text;
     } catch (err) {
+      clearTimeout(timeoutId);
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('429') || msg.includes('rate') || msg.includes('quota')) {
+      const lower = msg.toLowerCase();
+
+      if (msg.includes('aborted') || lower.includes('timeout')) {
+        logger.warn(`[OPENROUTER] ${slot.label} timed out — trying next slot.`);
+        continue;
+      }
+
+      if (
+        msg.includes('429') ||
+        msg.includes('402') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        lower.includes('rate') ||
+        lower.includes('quota') ||
+        lower.includes('credits')
+      ) {
         slot.quotaHits++;
         slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
-        logger.warn(`[GROQ] ${slot.label} rate limited — cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
+        logger.warn(`[OPENROUTER] ${slot.label} rate/quota limited — cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
         continue;
       }
       throw err;
     }
   }
-  throw new Error('GROQ_EXHAUSTED: All Groq keys are at rate limit.');
+  throw new Error('OPENROUTER_EXHAUSTED: All OpenRouter keys are at rate limit or timed out.');
 }
 
 // ============================================================================
-// ── 9. UNIFIED GENERATE — Groq → Gemini primary → Gemini rerank key
+// ── 9. UNIFIED GENERATE — OpenRouter → Gemini primary → Gemini rerank key
 // ============================================================================
 
 async function generate(
@@ -442,11 +492,11 @@ async function generate(
   temperature = 0.7,
 ): Promise<string> {
   try {
-    return await generateWithGroqRoster(prompt, temperature);
+    return await generateWithOpenRouterRoster(prompt, requireJson, temperature);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.startsWith('GROQ_EXHAUSTED')) throw err;
-    logger.warn('[ROSTER] Groq exhausted — falling back to Gemini primary.');
+    if (!msg.startsWith('OPENROUTER_EXHAUSTED')) throw err;
+    logger.warn('[ROSTER] OpenRouter exhausted — falling back to Gemini primary.');
   }
 
   try {
@@ -615,20 +665,6 @@ No explanation. No markdown. Pure JSON array only.`;
 // ── 12. PROMPT INJECTION GUARD
 // ============================================================================
 
-// FIX (accuracy): the old regex only caught obvious English phrases and
-// could be defeated by base64, unicode homoglyphs, and indirect injection.
-// The new detector is multi-signal:
-//   1) broader regex set covering known prompt-injection phrasings
-//   2) a unicode-normalized pass so homoglyphs (\u0430 Cyrillic 'a')
-//      are not used to bypass matching
-//   3) a base64 / hex blob heuristic for hidden payloads
-//   4) a per-query high non-alphanumeric ratio check (many control chars
-//      or zero-width chars in a short text is suspicious)
-//   5) a length-vs-meaning check (very long queries with very few words
-//      often hide a smuggled prompt)
-//
-// The detector is intentionally conservative — false positives only
-// trigger a 400 with a generic message; the LLM is never called.
 const INJECTION_PATTERNS: RegExp[] = [
   /ignore (all )?(previous|prior|above|preceding) (instructions|prompts?|directives|rules)/i,
   /you are now/i,
@@ -656,13 +692,10 @@ const INJECTION_PATTERNS: RegExp[] = [
   /\bno (rules|restrictions|limitations|filter)\b/i,
 ];
 
-// Normalize homoglyphs so attackers can't bypass the regex with Cyrillic etc.
 function normalizeHomoglyphs(s: string): string {
   return s
     .normalize('NFKD')
-    // strip combining marks
     .replace(/[\u0300-\u036f]/g, '')
-    // common Cyrillic / Greek look-alikes → Latin
     .replace(/[\u0430]/g, 'a').replace(/[\u0435]/g, 'e').replace(/[\u043E]/g, 'o')
     .replace(/[\u0440]/g, 'p').replace(/[\u0441]/g, 'c').replace(/[\u0443]/g, 'y')
     .replace(/[\u0445]/g, 'x').replace(/[\u0410]/g, 'A').replace(/[\u0415]/g, 'E')
@@ -676,33 +709,23 @@ function normalizeHomoglyphs(s: string): string {
     .replace(/[\u03A7]/g, 'X');
 }
 
-// Heuristic: detect base64 / hex blobs that could hide instructions.
 function hasHiddenBlob(s: string): boolean {
-  // 60+ contiguous base64-ish characters (incl. + / =) often means a
-  // hidden payload the model might be told to decode.
   if (/\b[A-Za-z0-9+/]{60,}={0,2}\b/.test(s)) return true;
-  // 80+ hex chars in a row
   if (/\b[0-9a-fA-F]{80,}\b/.test(s)) return true;
   return false;
 }
 
 function detectInjection(text: string): boolean {
   if (!text) return false;
-  // Strip zero-width / control chars that can hide tokens
   const stripped = text.replace(/[\u200B-\u200F\u2028-\u202F\uFEFF\u0000-\u001F]/g, ' ');
 
-  // 1) Regex pass on original
   if (INJECTION_PATTERNS.some(p => p.test(stripped))) return true;
 
-  // 2) Regex pass on homoglyph-normalized form
   const norm = normalizeHomoglyphs(stripped);
   if (norm !== stripped && INJECTION_PATTERNS.some(p => p.test(norm))) return true;
 
-  // 3) Hidden blob heuristic
   if (hasHiddenBlob(stripped)) return true;
 
-  // 4) Non-alphanumeric ratio: if more than 35% of characters are
-  //    non-alphanumeric AND non-whitespace, the query is suspicious.
   const meaningful = stripped.replace(/\s+/g, '');
   if (meaningful.length > 30) {
     const nonAlnum = (meaningful.match(/[^A-Za-z0-9]/g) ?? []).length;
@@ -716,41 +739,29 @@ function detectInjection(text: string): boolean {
 // ── 13. INTENT CLASSIFICATION & PROMPT BUILDING
 // ============================================================================
 
-// FIX (accuracy): the previous regex classified "Is 25 mm legal?" as
-// 'dimension' because of the 'mm' token — but the user really wanted a
-// compliance verdict. Order of checks + tighter patterns fix the routing.
 function classifyIntent(query: string): QueryIntent {
   const q = query.toLowerCase().trim();
 
-  // 1. Compliance first — questions that contain a verdict intent
-  //    ("is X legal", "can I", "pass/fail", "compliant") should always
-  //    take priority over dimension keywords that may appear inside them.
   if (/\b(legal|illegal|allowed|not allowed|permitted|prohibited|banned|forbidden|pass|fail|comply|compliant|non[- ]?compliant|violation|violate|can i|may i|is it ok|is .+ allowed|is .+ legal|is .+ permitted|is .+ prohibited|will .+ pass|will .+ fail|am i allowed)\b/.test(q)) {
     return 'compliance';
   }
 
-  // 2. Procedure — "how to", "steps", "install", "procedure"
   if (/\b(how to|steps|step[- ]by[- ]step|procedure|process|install|mount|attach|assemble|disassemble|replace|remove|test|inspect|check|verify|calibrate|tighten|torque|weld|braze|solder|connect|wire|route|run|route .+ through)\b/.test(q)) {
     return 'procedure';
   }
 
-  // 3. Definition — "what is", "define", "meaning of"
   if (/^(\s*)(what is|what's|whats|define|definition of|meaning of|what does .+ mean|what do you mean by|explain what|describe what)\b/.test(q)) {
     return 'definition';
   }
 
-  // 4. Dimension — only reached if not a compliance question. Require
-  //    either a unit (mm, cm, etc.) or a direct dimensional noun.
   if (/\b\d+\s*(mm|cm|m|inch|in|ft)\b/.test(q)) return 'dimension';
   if (/\b(how (wide|tall|long|thick|deep|small|large|big)|dimension|dimensional|size|length|width|height|weight|distance|radius|diameter|thickness|volume|area|cross[- ]section|clearance|gap|spacing)\b/.test(q)) {
     return 'dimension';
   }
 
-  // 5. Default
   return 'general';
 }
 
-// ── UPDATED PROMPT — direct, rule-first, no noise ───────────────────────────
 function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string, domain: string): string {
   const persona = `You are INDRA — the Integrated Neural Design and Regulations Assistant for Formula Student Racing Teams.
 
@@ -1000,10 +1011,10 @@ app.get('/health', (_req: Request, res: Response): void => {
     cooling: roster.filter(s => s.coolUntil > now).length,
   });
 
-  const groqRosterSummary = {
-    total:   groqRoster.length,
-    active:  groqRoster.filter(s => s.coolUntil <= now).length,
-    cooling: groqRoster.filter(s => s.coolUntil > now).length,
+  const openRouterRosterSummary = {
+    total:   openRouterRoster.length,
+    active:  openRouterRoster.filter(s => s.coolUntil <= now).length,
+    cooling: openRouterRoster.filter(s => s.coolUntil > now).length,
   };
 
   res.json({
@@ -1014,13 +1025,13 @@ app.get('/health', (_req: Request, res: Response): void => {
     cad_layer: 'PARTIALLY DISCONNECTED (dev)',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
-    groq_roster:    groqRosterSummary,
-    primary_roster: geminiRosterSummary(primaryRoster),
-    rerank_roster:  geminiRosterSummary(rerankRoster),
+    openrouter_roster: openRouterRosterSummary,
+    primary_roster:    geminiRosterSummary(primaryRoster),
+    rerank_roster:     geminiRosterSummary(rerankRoster),
   });
 });
 
-app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response): void => {
+app.get('/admin/keys', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
   const now = Date.now();
 
   const geminiRosterStatus = (roster: ModelSlot[]) =>
@@ -1033,20 +1044,21 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
       successCount: s.successCount,
     }));
 
-  const groqRosterStatus = groqRoster.map(s => ({
-    label:     s.label,
-    model:     'llama-4-scout-17b-16e-instruct',
-    status:    s.coolUntil > now ? 'cooling' : 'active',
-    coolUntil: s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
-    quotaHits: s.quotaHits,
+  const openRouterRosterStatus = openRouterRoster.map(s => ({
+    label:        s.label,
+    model:        s.modelName,
+    status:       s.coolUntil > now ? 'cooling' : 'active',
+    coolUntil:    s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
+    quotaHits:    s.quotaHits,
+    successCount: s.successCount,
   }));
 
   res.json({
-    generation_chain: 'Groq #1 → Groq #2 → Gemini primary → Gemini rerank key',
-    rerank_chain:     'Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity',
-    groq_roster:    groqRosterStatus,
-    primary_roster: geminiRosterStatus(primaryRoster),
-    rerank_roster:  geminiRosterStatus(rerankRoster),
+    generation_chain:  'OpenRouter #1 → OpenRouter #2 → Gemini primary → Gemini rerank key',
+    rerank_chain:      'Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity',
+    openrouter_roster: openRouterRosterStatus,
+    primary_roster:    geminiRosterStatus(primaryRoster),
+    rerank_roster:     geminiRosterStatus(rerankRoster),
     note: 'Models are tried in order. A cooled model is skipped until its cooldown expires.',
   });
 });
@@ -1060,9 +1072,6 @@ app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Respon
   res.json({ total_entries: semanticCache.size, active, expired, max_entries: CONFIG.CACHE_MAX_ENTRIES });
 });
 
-// FIX (accuracy): cache invalidation endpoint so the ingestion script
-// (or an admin) can flush the cache immediately after the rulebook
-// embeddings are updated — instead of waiting up to 60 minutes for TTL.
 app.post('/admin/cache/invalidate', generalLimiter, requireAuth, (req: Request, res: Response): void => {
   const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
   const removed = invalidateCache(domain);
@@ -1070,7 +1079,7 @@ app.post('/admin/cache/invalidate', generalLimiter, requireAuth, (req: Request, 
   res.json({ message: `Invalidated ${removed} cache entries${domain ? ` for domain "${domain}"` : ' (all domains)'}.`, removed });
 });
 
-app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: Response): void => {
+app.post('/admin/cache/clear', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
   const cleared = semanticCache.size;
   semanticCache.clear();
   logger.info('Cache cleared by admin', { cleared });
@@ -1107,9 +1116,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     VALID_DOMAINS.includes(domain.trim() as ValidDomain)
   ) ? domain.trim() : 'General';
 
-  // FIX (accuracy): log a warning whenever the client sends an unknown
-  // or missing domain so the operator can see the issue in the logs
-  // (otherwise it silently dilutes retrieval across all rules).
   if (typeof domain !== 'string' || !VALID_DOMAINS.includes(domain.trim() as ValidDomain)) {
     logger.warn('[DOMAIN] Request used missing or unknown domain; fell back to "General"', {
       requestId, received: domain ?? null,
@@ -1166,24 +1172,18 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       .filter((id): id is string => Boolean(id));
 
     // ── 3D Model resolution — PARTIALLY DISCONNECTED (dev) ──────────────────
-    // CAD resolution logic is preserved but mesh data is suppressed in the response.
-    // To re-enable: restore the keywordCadMatch fetch above and un-comment the
-    // topModel / mesh resolution block below, then remove the override at the bottom.
-    //
-    // const topModel: ModelRecord | null = null;   // disabled
-    // const highlightMeshes: string[] = [];        // disabled
-    // const contextMeshes: string[] = [];          // disabled
-    // const cadNodes: CadNodeMatch[] = [];         // disabled
-    //
-    // [original resolution block preserved below for reference, do not delete]
-    // if (keywordCadMatch?.model_id) { ... }
-    // else if (hasRuleMatches && ruleIds.length > 0) { ... }
-    // if (!topModel) { ... }
-
     const topModel: ModelRecord | null     = null;
     const highlightMeshes: string[]        = [];
     const contextMeshes: string[]          = [];
     const cadNodes: CadNodeMatch[]         = [];
+
+    void topModel;
+    void ruleIds;
+    void extractKeywordsFromQuery;
+    void buildModelMetadata;
+    void fetchModelById;
+    void fetchCadNodesForRules;
+    void fetchCadByKeyword;
 
     logger.info('[CAD] 3D layer partially disconnected — meshes suppressed (dev mode)', { requestId });
 
@@ -1203,7 +1203,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     }
 
     // ── Generate answer ───────────────────────────────────────────────────────
-    // Rule context: content only, no relevance scores — keeps prompt clean
     const ruleContext = [
       ...rerankedRules.map(r => `[Rule ${r.rule_id}]\n${r.content}`),
       ...(hasLearnedMatches
@@ -1223,7 +1222,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         rule_id:    r.rule_id,
         content:    r.content,
         similarity: r.similarity,
-        // rerank_score omitted from client response — internal detail
       })),
     };
 
@@ -1235,7 +1233,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       }));
     }
 
-    // 3D model fields — returned as empty/null while layer is disconnected
     responsePayload.model_url        = null;
     responsePayload.model_metadata   = null;
     responsePayload.highlight_meshes = [];
@@ -1252,7 +1249,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       domain:                  sanitizedDomain,
       intent,
       model_found:             false,
-      model_name:              null, // 3D layer disconnected
+      model_name:              null,
       citations_count:         rerankedRules.length,
       learned_citations_count: learnedMatches.length,
       cad_nodes_count:         cadNodes.length,
@@ -1265,7 +1262,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
   } catch (error: unknown) {
     const msg              = error instanceof Error ? error.message : String(error);
-    const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED');
+    const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED') || msg.includes('OPENROUTER_EXHAUSTED');
     const isEmbedExhausted = msg.includes('EMBED_EXHAUSTED');
     const isTimeout        = msg.startsWith('TIMEOUT:') || msg.includes('EMBED_TIMEOUT');
 
@@ -1284,34 +1281,18 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 });
 
 // ── Feedback & learning ──────────────────────────────────────────────────────
-// FIX (accuracy): the previous /feedback accepted any question/answer pair
-// and saved "good"-rated ones directly to the sora_learned table. Because
-// the learned table is later retrieved via match_learned_chunks and
-// injected verbatim into the model context, an attacker could RAG-poison
-// the system by submitting misleading Q/A pairs. We now:
-//
-//   - Reject pairs whose answer doesn't reference a rule ID (FB rules
-//     always cite one in the form [T3.1.2], [EV4.3], [A1.2.3], etc.).
-//   - Reject pairs that try to smuggle injection payloads.
-//   - Require a minimum 8-word answer to prevent single-sentence poisoning.
-//   - Reject "good" ratings when the answer looks like a refusal or
-//     when the question contains URLs / code blocks / escape sequences.
 const RULE_ID_RE = /\b([A-Z]{1,3}\d+(?:\.\d+){1,3})\b/;
 const URL_RE     = /\bhttps?:\/\/\S+/i;
 const CODE_RE    = /```|<code>|function\s*\(|class\s+\w+\s*[{:]/i;
 const ESC_RE     = /\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}/;
 
 function isValidLearnedPair(question: string, answer: string): { ok: boolean; reason?: string } {
-  // Require a rule reference in the answer — that is the format INDRA
-  // already produces, so any legitimate AI answer will have one.
   if (!RULE_ID_RE.test(answer)) {
     return { ok: false, reason: 'answer must reference a rule ID (e.g. [T3.1.2])' };
   }
-  // Reject answers that look like refusals or out-of-band content.
   if (/^(i (can'?t|cannot|am unable)|as an? (ai|language model)|i don'?t have)/i.test(answer.trim())) {
     return { ok: false, reason: 'answer appears to be a refusal, not a rule citation' };
   }
-  // Reject hidden payloads in either side.
   if (URL_RE.test(question) || URL_RE.test(answer)) {
     return { ok: false, reason: 'URLs are not allowed in learned pairs' };
   }
@@ -1324,7 +1305,6 @@ function isValidLearnedPair(question: string, answer: string): { ok: boolean; re
   if (detectInjection(question) || detectInjection(answer)) {
     return { ok: false, reason: 'injection patterns detected' };
   }
-  // Require a substantive answer (8+ words) to prevent terse poisoning.
   if (answer.trim().split(/\s+/).length < 8) {
     return { ok: false, reason: 'answer is too short to be a valid learned pair' };
   }
@@ -1362,7 +1342,6 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
     const dbTasks: Promise<void>[] = [];
 
     if (rating === 'good') {
-      // Validate the pair before persisting — prevents RAG poisoning.
       const check = isValidLearnedPair(trimmedQuestion, trimmedAnswer);
       if (!check.ok) {
         logger.warn('[FEEDBACK] Rejected learned pair', { requestId, userId, reason: check.reason });
@@ -1485,11 +1464,6 @@ correctAnswer is the 0-based index of the correct option.
 REGULATION EXCERPTS:
 ${context}`;
 
-// FIX (accuracy): validate the LLM's JSON output against a strict schema
-// before sending it to the client. Previously malformed arrays
-// (missing options, out-of-range correctAnswer, etc.) were passed
-// straight through. Also, the correct answer index is STRIPPED from the
-// response so the quiz doesn't spoil itself before the user answers.
     const raw       = await generate(prompt, true, 0.4);
     const cleaned   = raw.replace(/```json|```/g, '').trim();
     let questions: unknown;
@@ -1519,59 +1493,4 @@ ${context}`;
         continue;
       }
       validQuestions.push({
-        question:   q.question,
-        options:    q.options as string[],
-        explanation: typeof q.explanation === 'string' ? q.explanation : '',
-        rule_id:     typeof q.rule_id === 'string' ? q.rule_id : '',
-      });
-    }
-
-    if (validQuestions.length === 0) {
-      res.status(502).json({ error: 'Quiz generation produced no valid questions.', code: 'NO_VALID_QUESTIONS' });
-      return;
-    }
-
-    // FIX (accuracy): never send correctAnswer to the client before
-    // the user answers — previously the index was shipped inside the
-    // questions array, spoiling the quiz.
-    res.json({
-      questions: validQuestions,
-      domain,
-      generated: true,
-      _meta: { generated_count: validQuestions.length, requested_count: questionCount },
-    });
-  } catch (err) {
-    logger.error('Quiz generation error', err);
-    res.status(500).json({ error: 'Failed to generate quiz questions.', code: 'INTERNAL_ERROR' });
-  }
-});
-
-// ============================================================================
-// ── 16. ERROR HANDLING & STARTUP
-// ============================================================================
-
-app.use((_req: Request, res: Response): void => {
-  res.status(404).json({ error: 'Route not found.', code: 'NOT_FOUND' });
-});
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void => {
-  logger.error('Unhandled error', error);
-  res.status(500).json({ error: 'Something went wrong. Please try again.', code: 'INTERNAL_ERROR' });
-});
-
-app.listen(PORT, () => {
-  console.log(`\n🚀  INDRA RAG Backend v14.0.0-dev`);
-  console.log(`🌐  http://localhost:${PORT}`);
-  console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
-  console.log(`⚠️   Auth         : BYPASSED — all requests accepted as dev@local (admin)`);
-  console.log(`⚠️   3D Layer     : PARTIALLY DISCONNECTED — mesh data suppressed in responses`);
-  console.log(`🛡️   Security     : Helmet + Rate Limiting + Injection Guard (still active)`);
-  console.log(`🔑  Groq keys    : ${groqRoster.length} keys (llama-4-scout-17b-16e-instruct) — PRIMARY generation`);
-  console.log(`🔑  Gemini key   : ${primaryRoster.length} models — generation fallback`);
-  console.log(`🔑  Rerank key   : ${rerankRoster.length} models — rerank + last-resort generation`);
-  console.log(`🔀  Gen chain    : Groq #1 → Groq #2 → Gemini primary → Gemini rerank key`);
-  console.log(`🔀  Rerank chain : Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity`);
-  console.log(`🧠  Embed model  : nomic-embed-text-v1.5 (Nomic Atlas)`);
-  console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries\n`);
-});
+        question:    q.question
