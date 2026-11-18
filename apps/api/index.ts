@@ -300,11 +300,13 @@ const geminiClients = [
     client: new GoogleGenerativeAI(key),
   }));
 
-// Active 2026 production models (free-tier & Tier-1 compatible)
+// Active 2026 production models
 const GEMINI_MODELS = [
+  'gemini-4-hydrogen',
   'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
 ] as const;
+
 async function generate(
   prompt: string,
   requireJson = false,
@@ -344,6 +346,30 @@ async function generate(
     ? lastError
     : new Error('QUOTA_EXHAUSTED: All configured Gemini models/keys failed.');
 }
+
+async function generateFast(prompt: string, temperature = 0.1): Promise<string> {
+  for (const slot of geminiClients) {
+    try {
+      const model = slot.client.getGenerativeModel({
+        model: 'gemini-3.5-flash-lite',
+        generationConfig: { temperature },
+      });
+      const result = await withTimeout(
+        model.generateContent(prompt),
+        CONFIG.GEMINI_TIMEOUT_MS,
+        `${slot.label}/gemini-3.5-flash-lite`,
+      );
+      logger.info(`[COMPRESS] ${slot.label}/gemini-3.5-flash-lite ✓`);
+      return result.response.text();
+    } catch (err) {
+      logger.warn(`[COMPRESS] ${slot.label} failed — trying next key.`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  throw new Error('COMPRESS_FAILED');
+}
+
 
 // ============================================================================
 // ── 10. EMBEDDINGS — Nomic Atlas
@@ -612,30 +638,32 @@ function classifyIntent(query: string): QueryIntent {
 function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string, domain: string): string {
   const intentGuidance: Record<QueryIntent, string> = {
     dimension:
-      'The user is looking for specific measurements, tolerances, or structural limits. Give the exact figures upfront, then smoothly connect any secondary dimensional or material constraints from linked rules.',
+      'Lead with the exact numeric limits and tolerances requested, then explain the mechanical or ergonomic reasoning behind them.',
     compliance:
-      'The user is checking legality or scrutineering compliance. Give a clear, direct verdict early on, then walk through the exact rule conditions and edge cases that determine whether the design passes or fails.',
+      'Give a clear compliance verdict upfront, then walk through the exact engineering criteria and edge cases that decide pass/fail at tech inspection.',
     definition:
-      'The user wants to understand a regulation term or component. Define it clearly in plain engineering language first, then explain how the rules govern its design or placement.',
+      'Explain what the component or boundary actually is in real racecar terms first, clearly separating it from easily confused rulebook terms.',
     procedure:
-      'The user is asking how to build, mount, wire, or inspect something. Walk through the requirements in a logical engineering sequence, highlighting mandatory scrutineering checkpoints along the way.',
+      'Walk through the build, mounting, or inspection steps in logical engineering order, highlighting critical scrutineering checks.',
     general:
-      'Answer the question naturally like a senior Formula Student design lead—explain the rule logic clearly and connect related sub-systems where relevant.',
+      'Answer the exact question asked like a senior Formula Student design lead—explain the engineering logic clearly and only bring in connected rules if they directly interact with the question.',
   };
 
-  return `You are INDRA, a senior Formula Student regulations and scrutineering engineer helping a race team interpret the Formula Bharat rulebook.
+  return `You are INDRA, a senior Formula Student scrutineering and design engineer helping a team interpret the Formula Bharat rulebook.
 
-CORE PRINCIPLES:
-- Write naturally with smooth transitions, like a sharp teammate explaining rules over a CAD review—never sound like a rigid template or a robotic FAQ.
-- Choose the clearest format on your own: use flowing prose for conceptual explanations, natural paragraphs mixed with short bullet lists for multi-part specs, or numbered steps for procedures. Vary your openings organically.
-- Get straight to the point without robotic filler ("Based on the provided context...", "According to the regulations...").
-- Synthesize primary rules and connected graph rules into one cohesive explanation rather than treating every rule as an isolated bullet.
+HOW TO REASON AND WRITE:
+1. **Answer ONLY what the user asked:** Do NOT summarize every rule in the context. Filter out any rule or graph neighbor that belongs to an unrelated sub-system (for example, ignore composite equivalency or IC intake rules if the user asked about a standard steel tubular Side Impact Structure).
+2. **Synthesize with Engineering Intuition:** Combine exact rulebook constraints with your own mechanical/electrical engineering knowledge to explain *why* the rule exists, how load paths or failure modes behave, and what matters in CAD and tech inspection. Never just stitch rule sentences together with filler grammar.
+3. **Keep Distinct Terms Separate:** Never blur separate rulebook definitions together (e.g., physical *Side Impact Structure* [T.3.14] vs. the geometric *Side Impact Structure Envelope* zone [T.1.1.17]).
+4. **Natural, Unscripted Flow:** Vary your structure organically (clean prose, mixed paragraphs + bullets, or steps) based on what fits the question best.
 
-STRICT CITATION & GROUNDING RULES:
-- Cite exact rule IDs inline in square brackets right where a requirement is stated (e.g., "The main hoop must be constructed from a single piece of uncut, continuous steel tubing [T.3.8.1].").
-- ONLY cite rule IDs that explicitly appear as [Rule X.Y.Z] headers in the REGULATION CONTEXT below. Never invent rule numbers or cite unprovided rules from memory.
-- If the provided rules only partially cover the question, answer what is explicitly supported by the context and briefly note what isn't specified in the retrieved rules.
-- Only include a brief scrutineering tip at the end if there is a genuine, non-obvious inspection trap in the rules—skip it otherwise.
+STYLE EXAMPLE (Follow this natural engineering tone, NOT rigid rulebook paraphrasing):
+- Raw Rule Input: [Rule T.3.8.1 | Section: Main Hoop] The main hoop must be constructed of a single piece of uncut, continuous, closed section steel tubing.
+- Target Response Style: Your main hoop has to be bent from one continuous length of closed-section steel tubing—you cannot weld two pieces together or splice in a section anywhere along the hoop [T.3.8.1]. Keeping it uncut avoids introducing heat-affected weld zones in the primary rollover load path, which scrutineers will immediately fail during chassis inspection.
+
+STRICT CITATION GUARDRAIL:
+- Cite rule IDs inline in square brackets right after the specific requirement they support (e.g., [T.3.14.1]).
+- ONLY cite rule IDs that explicitly appear as [Rule X.Y.Z ...] headers in the REGULATION CONTEXT below. Never invent or guess rule numbers.
 
 QUERY FOCUS (${domain}):
 ${intentGuidance[intent]}
@@ -729,6 +757,44 @@ app.post('/admin/cache/clear', generalLimiter, requireAuth, (_req: Request, res:
   logger.info('Cache cleared by admin', { cleared });
   res.json({ message: `Cleared ${cleared} cache entries.` });
 });
+
+async function compressRelevantEvidence(
+  query: string,
+  rules: RuleChunk[],
+): Promise<string> {
+  if (rules.length === 0) return '';
+
+  const rawDump = rules
+    .map(
+      r =>
+        `[Rule ${r.rule_id}${r.section ? ` | Section: ${r.section}` : ''} | Role: ${r.match_role ?? 'primary'}]\n${r.content}`
+    )
+    .join('\n\n');
+
+  const filterPrompt = `You are a strict technical relevance filter for Formula Bharat regulations.
+Given a TEAM QUESTION and RETRIEVED RULES, extract ONLY the rules and exact facts that directly answer or materially constrain the question asked.
+
+STRICT FILTERING RULES:
+- Discard any rule belonging to an unrelated sub-system (e.g., drop composite monocoque or IC air intake rules if the user asked about a standard steel tubular Side Impact Structure).
+- Keep distinct rulebook concepts clearly separated (e.g., physical Side Impact Structure rules vs. geometric Side Impact Structure Envelope definitions).
+- Preserve exact numbers, dimensions, materials, and [Rule X.Y.Z] IDs verbatim.
+- Output ONLY the filtered rules and facts—no conversational filler.
+
+TEAM QUESTION: "${query}"
+
+RETRIEVED RULES:
+${rawDump}`;
+
+  try {
+    const compressed = await generateFast(filterPrompt, 0.1);
+    return compressed.trim() || rawDump;
+  } catch (err) {
+    logger.warn('[COMPRESS] Evidence filter failed — falling back to raw context', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return rawDump;
+  }
+}
 
 // ── Main GraphRAG endpoint ───────────────────────────────────────────────────
 app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
@@ -848,32 +914,20 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     }
 
     // 3. Build enriched pre-prompt context with graph relationship explanations
+    const filteredRulesText = await compressRelevantEvidence(trimmed, rerankedRules);
+
     const ruleContext = [
-      ...rerankedRules.map(r => {
-        const roleTag =
-          r.match_role === 'explicit_primary'
-            ? ' [DIRECTLY CITED RULE]'
-            : r.match_role === 'graph_related'
-            ? ' [CONNECTED GRAPH RULE]'
-            : '';
-
-        const crossRefs = r.relations_metadata && r.relations_metadata.length > 0
-          ? `\nCross-References: ${r.relations_metadata
-              .map(rel => `${rel.relation_type} ${rel.target_rule_id} (${rel.context})`)
-              .join(' | ')}`
-          : '';
-
-        return `[Rule ${r.rule_id}${roleTag}]\n${r.content}${crossRefs}`;
-      }),
+      filteredRulesText,
       ...(hasLearnedMatches
-        ? ['\n--- PREVIOUSLY VERIFIED ANSWERS ---',
-           ...learnedMatches.map(l => `Q: ${l.question}\nA: ${l.answer}`)]
+        ? [
+            '\n=== VERIFIED PAST ANSWERS ===',
+            ...learnedMatches.map(l => `Q: ${l.question}\nA: ${l.answer}`),
+          ]
         : []),
-    ].join('\n\n---\n\n');
+    ].join('\n\n');
 
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
-    const answer       = await generate(systemPrompt, false, 0.35);
-
+    const answer       = await generate(systemPrompt, false, 0.6);
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
