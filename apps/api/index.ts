@@ -252,15 +252,22 @@ const logger = {
     }),
 };
 
-async function saveLog(data: Record<string, unknown>): Promise<void> {
+async function saveLog(entry: Record<string, unknown>) {
   try {
-    const { error } = await supabase.from('sora_logs').insert([data]);
-    if (error) logger.error('saveLog DB error', error);
-  } catch (err: unknown) {
-    logger.error('saveLog threw', err);
+    const { error } = await supabase.from('query_logs').insert(entry);
+    if (error) {
+      logger.error('saveLog DB error', {
+        message: error.message,
+        details: error.details,
+        code: error.code,
+      });
+    }
+  } catch (err) {
+    logger.error('saveLog DB exception', {
+      message: err instanceof Error ? err.message : JSON.stringify(err),
+    });
   }
 }
-
 async function saveLearnedPair(
   question: string,
   answer: string,
@@ -301,9 +308,9 @@ const geminiClients = [
   }));
 
 const GEMINI_MODELS = [
-  'gemini-4-hydrogen',
-  'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-4-hydrogen',
 ] as const;
 
 async function generate(
@@ -321,9 +328,7 @@ async function generate(
           generationConfig: {
             temperature,
             ...(requireJson ? { responseMimeType: 'application/json' } : {}),
-            ...(modelName.includes('hydrogen') || modelName.includes('3.8')
-              ? { thinkingConfig: { thinkingLevel: 'low' } }
-              : {}),
+            thinkingConfig: { thinkingBudget: 0 },
           } as any,
         });
 
@@ -916,7 +921,15 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     }
 
     // 3. Build enriched pre-prompt context with graph relationship explanations
-    const filteredRulesText = await compressRelevantEvidence(trimmed, rerankedRules);
+    const filteredRulesText =
+      rerankedRules.length > 4
+        ? await compressRelevantEvidence(trimmed, rerankedRules)
+        : rerankedRules
+            .map(
+              r =>
+                `[Rule ${r.rule_id}${r.section ? ` | Section: ${r.section}` : ''}]\n${r.content}`
+            )
+            .join('\n\n');
 
     const ruleContext = [
       filteredRulesText,
