@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
+import Groq from 'groq-sdk';
 import crypto from 'crypto';
 
 dotenv.config();
@@ -15,14 +16,8 @@ dotenv.config();
 // ============================================================================
 
 const requiredEnvVars = [
-  // 'SUPABASE_URL',        // AUTH BYPASSED — not needed for dev
-  // 'SUPABASE_ANON_KEY',   // AUTH BYPASSED — not needed for dev
   'GEMINI_API_KEY',
-  'GEMINI_RERANK_API_KEY',
   'NOMIC_API_KEY',
-  // 'API_AUTH_TOKEN',      // AUTH BYPASSED — skipping token check
-  'OPENROUTER_API_KEY_1',
-  'OPENROUTER_API_KEY_2',
   'COHERE_API_KEY',
 ];
 
@@ -43,26 +38,11 @@ export const VALID_DOMAINS = [
 ] as const;
 type ValidDomain = typeof VALID_DOMAINS[number];
 
-// FIX (accuracy):
-//  - MATCH_THRESHOLD: tuned from 0.4 → 0.5 for nomic-embed-text-v1.5.
-//    The old 0.4 threshold was inherited from the previous Gemini
-//    embedding model. Nomic vectors have a tighter similarity
-//    distribution, so 0.4 was pulling in marginally related chunks and
-//    diluting the model's focus. 0.5 keeps the on-topic chunks and
-//    drops the noise.
-//  - LEARNED_MATCH_THRESHOLD: dropped 0.75 → 0.7 so the system more
-//    often uses its prior good answers (recoveries from user feedback)
-//    instead of recomputing from scratch.
-//  - CACHE_SIMILARITY_THRESHOLD: dropped 0.97 → 0.94. 0.97 was so
-//    tight that the cache was effectively dead — two semantically
-//    equivalent phrasings rarely hit 0.97. 0.94 still rejects truly
-//    different queries but accepts the "front impact structure specs"
-//    vs "specs for the front impact structure" style of reuse.
-//  - MATCH_COUNT: bumped 5 → 7 to give the reranker more signal.
 const CONFIG = {
   MATCH_THRESHOLD: 0.5,
   LEARNED_MATCH_THRESHOLD: 0.7,
   MATCH_COUNT: 7,
+  GRAPH_RELATED_LIMIT: 6,
   LEARNED_MATCH_COUNT: 3,
   CACHE_TTL_MS: 60 * 60 * 1000,
   CACHE_SIMILARITY_THRESHOLD: 0.94,
@@ -77,9 +57,6 @@ const CONFIG = {
   GEMINI_TIMEOUT_MS: 25_000,
   RERANK_CHUNK_PREVIEW: 250,
 } as const;
-
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
 
 // ── Supabase client — still used for DB queries (not auth) ──────────────────
 const supabase = createClient(
@@ -106,11 +83,29 @@ interface AuthenticatedRequest extends Request {
   };
 }
 
+interface RuleRelation {
+  target_rule_id: string;
+  relation_type: string;
+  context: string;
+}
+
 interface RuleChunk {
   rule_id: string;
+  section?: string;
   content: string;
+  relations_metadata?: RuleRelation[];
+  match_role?: 'explicit_primary' | 'vector_primary' | 'graph_related';
   similarity: number;
   rerank_score?: number;
+}
+
+interface RawGraphRuleRow {
+  rule_id: string;
+  section: string;
+  rule_text: string;
+  relations_metadata: RuleRelation[] | null;
+  match_role: 'explicit_primary' | 'vector_primary' | 'graph_related';
+  similarity: number;
 }
 
 interface LearnedChunk {
@@ -157,13 +152,11 @@ interface ModelSlot {
   successCount: number;
 }
 
-interface OpenRouterSlot {
+interface GroqSlot {
   label: string;
-  apiKey: string;
-  modelName: string;
+  client: Groq;
   coolUntil: number;
   quotaHits: number;
-  successCount: number;
 }
 
 // ============================================================================
@@ -184,11 +177,14 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return mag === 0 ? 0 : dot / mag;
 }
 
-function findCacheHit(embedding: number[], domain: string): Record<string, unknown> | null {
+function findCacheHit(embedding: number[], domain: string, explicitRuleIds: string[]): Record<string, unknown> | null {
   const now = Date.now();
+  const rulePrefix = explicitRuleIds.length > 0 ? explicitRuleIds.slice().sort().join(',') : 'none';
+  const expectedPrefix = `${domain}:${rulePrefix}:`;
+
   for (const [key, entry] of semanticCache.entries()) {
     if (entry.expiresAt < now) { semanticCache.delete(key); continue; }
-    if (!key.startsWith(domain + ':')) continue;
+    if (!key.startsWith(expectedPrefix)) continue;
     if (cosineSimilarity(embedding, entry.embedding) >= CONFIG.CACHE_SIMILARITY_THRESHOLD) {
       return entry.response;
     }
@@ -196,25 +192,23 @@ function findCacheHit(embedding: number[], domain: string): Record<string, unkno
   return null;
 }
 
-// FIX (accuracy): MD5 is cryptographically broken and a poor cache key choice.
-// Replaced with SHA-256, and the cache key now includes a domain prefix
-// plus a short fingerprint so collisions are virtually impossible.
-function writeCache(embedding: number[], domain: string, response: Record<string, unknown>): void {
+function writeCache(
+  embedding: number[],
+  domain: string,
+  explicitRuleIds: string[],
+  response: Record<string, unknown>,
+): void {
   if (semanticCache.size >= CONFIG.CACHE_MAX_ENTRIES) {
     const oldestKey = semanticCache.keys().next().value;
     if (oldestKey) semanticCache.delete(oldestKey);
     logger.info(`Cache eviction: max entries (${CONFIG.CACHE_MAX_ENTRIES}) reached.`);
   }
+  const rulePrefix = explicitRuleIds.length > 0 ? explicitRuleIds.slice().sort().join(',') : 'none';
   const hash = crypto.createHash('sha256').update(JSON.stringify(embedding)).digest('hex').slice(0, 32);
-  const key = `${domain}:${hash}`;
+  const key = `${domain}:${rulePrefix}:${hash}`;
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
 }
 
-// FIX (accuracy): explicit cache invalidation hook. The old code relied on
-// the 60-minute TTL and a 10-minute GC, which meant that after a rulebook
-// re-ingestion the API would still serve the OLD cached answers for up to
-// an hour. Now the ingestion script can call invalidateCache() via a new
-// admin endpoint to flush the cache the moment the new embeddings land.
 export function invalidateCache(domain?: string): number {
   if (!domain) {
     const size = semanticCache.size;
@@ -293,221 +287,62 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 // ============================================================================
-// ── 7. GEMINI MODEL ROSTER & CIRCUIT BREAKER
+// ── 7. GEMINI GENERATION ENGINE (Primary Key + Backup Key)
 // ============================================================================
 
-function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
-  const client = new GoogleGenerativeAI(apiKey);
-  const models = [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
-  ];
-  return models.map(modelName => ({
-    label: `${keyLabel}/${modelName}`,
-    modelName,
-    client,
-    coolUntil: 0,
-    quotaHits: 0,
-    successCount: 0,
-  }));
-}
-
-const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!, 'PRIMARY');
-const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
-
-function activeSlots(roster: ModelSlot[]): ModelSlot[] {
-  const now = Date.now();
-  const active = roster.filter(s => s.coolUntil <= now);
-  return active.length > 0 ? active : roster;
-}
-
-function coolSlot(slot: ModelSlot): void {
-  slot.quotaHits++;
-  slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
-  logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
-}
-
-function isSkippableError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error);
-  const lower = msg.toLowerCase();
-  return (
-    msg.includes('429')                               ||
-    lower.includes('quota')                           ||
-    lower.includes('resource_exhausted')              ||
-    lower.includes('rate_limit')                      ||
-    msg.includes('404')                               ||
-    lower.includes('not found')                       ||
-    lower.includes('is not supported')                ||
-    lower.includes('not supported for generatecontent')
-  );
-}
-
-async function generateWithRoster(
-  prompt: string,
-  roster: ModelSlot[],
-  requireJson = false,
-  temperature = 0.7,
-): Promise<string> {
-  const slots = activeSlots(roster);
-  for (const slot of slots) {
-    try {
-      const model = slot.client.getGenerativeModel({
-        model: slot.modelName,
-        generationConfig: {
-          temperature,
-          ...(requireJson ? { responseMimeType: 'application/json' } : {}),
-        },
-      });
-      const result = await withTimeout(
-        model.generateContent(prompt),
-        CONFIG.GEMINI_TIMEOUT_MS,
-        slot.label,
-      );
-      const text = result.response.text();
-      slot.successCount++;
-      logger.info(`[ROSTER] ${slot.label} ✓ (successes: ${slot.successCount})`);
-      return text;
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      if (msg.startsWith('TIMEOUT:')) {
-        logger.warn(`[ROSTER] ${slot.label} timed out — trying next slot.`);
-        continue;
-      }
-      if (isSkippableError(error)) {
-        coolSlot(slot);
-        continue;
-      }
-      throw error;
-    }
-  }
-  throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota. Try again shortly.');
-}
-
-// ============================================================================
-// ── 8. OPENROUTER ROSTER
-// ============================================================================
-
-function buildOpenRouterRoster(): OpenRouterSlot[] {
-  return [
-    process.env.OPENROUTER_API_KEY_1,
-    process.env.OPENROUTER_API_KEY_2,
-  ]
+const geminiClients = [
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_BACKUP_API_KEY, // Optional second key in .env
+]
   .filter((key): key is string => Boolean(key))
-  .map((apiKey, i) => ({
-    label: `OPENROUTER_KEY_${i + 1}`,
-    apiKey,
-    modelName: OPENROUTER_MODEL,
-    coolUntil: 0,
-    quotaHits: 0,
-    successCount: 0,
+  .map((key, idx) => ({
+    label: idx === 0 ? 'GEMINI_PRIMARY' : 'GEMINI_BACKUP',
+    client: new GoogleGenerativeAI(key),
   }));
-}
 
-const openRouterRoster = buildOpenRouterRoster();
-
-async function generateWithOpenRouterRoster(
-  prompt: string,
-  requireJson = false,
-  temperature = 0.7,
-): Promise<string> {
-  const now = Date.now();
-  const active = openRouterRoster.filter(s => s.coolUntil <= now);
-  const slots = active.length > 0 ? active : openRouterRoster;
-
-  for (const slot of slots) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.GEMINI_TIMEOUT_MS);
-
-    try {
-      const response = await fetch(OPENROUTER_URL, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${slot.apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:8000',
-          'X-Title': process.env.OPENROUTER_APP_NAME || 'INDRA RAG Backend',
-        },
-        body: JSON.stringify({
-          model: slot.modelName,
-          messages: [{ role: 'user', content: prompt }],
-          temperature,
-          ...(requireJson ? { response_format: { type: 'json_object' } } : {}),
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`OpenRouter HTTP ${response.status}: ${errText}`);
-      }
-
-      const data = await response.json() as {
-        choices?: { message?: { content?: string } }[];
-      };
-
-      const text = data.choices?.[0]?.message?.content ?? '';
-      slot.successCount++;
-      logger.info(`[OPENROUTER] ${slot.label} ✓ (successes: ${slot.successCount})`);
-      return text;
-    } catch (err) {
-      clearTimeout(timeoutId);
-      const msg = err instanceof Error ? err.message : String(err);
-      const lower = msg.toLowerCase();
-
-      if (msg.includes('aborted') || lower.includes('timeout')) {
-        logger.warn(`[OPENROUTER] ${slot.label} timed out — trying next slot.`);
-        continue;
-      }
-
-      if (
-        msg.includes('429') ||
-        msg.includes('402') ||
-        msg.includes('502') ||
-        msg.includes('503') ||
-        lower.includes('rate') ||
-        lower.includes('quota') ||
-        lower.includes('credits')
-      ) {
-        slot.quotaHits++;
-        slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
-        logger.warn(`[OPENROUTER] ${slot.label} rate/quota limited — cooling for ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error('OPENROUTER_EXHAUSTED: All OpenRouter keys are at rate limit or timed out.');
-}
-
-// ============================================================================
-// ── 9. UNIFIED GENERATE — OpenRouter → Gemini primary → Gemini rerank key
-// ============================================================================
-
+// Active 2026 production models (free-tier & Tier-1 compatible)
+const GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+] as const;
 async function generate(
   prompt: string,
   requireJson = false,
   temperature = 0.7,
 ): Promise<string> {
-  try {
-    return await generateWithOpenRouterRoster(prompt, requireJson, temperature);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.startsWith('OPENROUTER_EXHAUSTED')) throw err;
-    logger.warn('[ROSTER] OpenRouter exhausted — falling back to Gemini primary.');
+  let lastError: unknown;
+
+  for (const slot of geminiClients) {
+    for (const modelName of GEMINI_MODELS) {
+      try {
+        const model = slot.client.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            temperature,
+            ...(requireJson ? { responseMimeType: 'application/json' } : {}),
+          },
+        });
+
+        const result = await withTimeout(
+          model.generateContent(prompt),
+          CONFIG.GEMINI_TIMEOUT_MS,
+          `${slot.label}/${modelName}`,
+        );
+
+        logger.info(`[AI] ${slot.label}/${modelName} ✓`);
+        return result.response.text();
+      } catch (err) {
+        lastError = err;
+        logger.warn(`[AI] ${slot.label}/${modelName} failed — trying next option.`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
-  try {
-    return await generateWithRoster(prompt, primaryRoster, requireJson, temperature);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.startsWith('QUOTA_EXHAUSTED')) throw err;
-    logger.warn('[ROSTER] Gemini primary exhausted — falling back to Gemini rerank key.');
-  }
-
-  return generateWithRoster(prompt, rerankRoster, requireJson, temperature);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('QUOTA_EXHAUSTED: All configured Gemini models/keys failed.');
 }
 
 // ============================================================================
@@ -608,9 +443,7 @@ async function rerankChunks(query: string, chunks: RuleChunk[]): Promise<RuleChu
 
     if (!response.ok) throw new Error(`Cohere error ${response.status}: ${await response.text()}`);
 
-    const data = await response.json() as {
-      results: { index: number; relevance_score: number }[]
-    };
+    const data = await resJson(response);
 
     logger.info('[RERANKER] Cohere ✓');
     return data.results.map(r => ({
@@ -640,7 +473,7 @@ Example for 3 chunks: [0.95, 0.3, 0.87]
 No explanation. No markdown. Pure JSON array only.`;
 
   try {
-    const raw     = await generateWithRoster(prompt, rerankRoster, true, 0.1);
+    const raw     = await generate(prompt, true, 0.1);
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const scores: number[] = JSON.parse(cleaned);
 
@@ -659,6 +492,14 @@ No explanation. No markdown. Pure JSON array only.`;
       .sort((a, b) => b.similarity - a.similarity)
       .map(c => ({ ...c, rerank_score: c.similarity }));
   }
+}
+
+async function resJson(response: globalThis.Response): Promise<{
+  results: { index: number; relevance_score: number }[];
+}> {
+  return await response.json() as {
+    results: { index: number; relevance_score: number }[];
+  };
 }
 
 // ============================================================================
@@ -736,8 +577,14 @@ function detectInjection(text: string): boolean {
 }
 
 // ============================================================================
-// ── 13. INTENT CLASSIFICATION & PROMPT BUILDING
+// ── 13. INTENT CLASSIFICATION, MULTI-RULE EXTRACTION & PROMPT BUILDING
 // ============================================================================
+
+function extractMentionedRuleIds(userPrompt: string): string[] {
+  const regex = /\b(A|T|EV|CV|IN|S|D)\s*\.?\s*(\d+(?:\.\d+)*)\b/gi;
+  const matches = [...userPrompt.matchAll(regex)];
+  return [...new Set(matches.map(m => `${m[1].toUpperCase()}.${m[2]}`))];
+}
 
 function classifyIntent(query: string): QueryIntent {
   const q = query.toLowerCase().trim();
@@ -767,16 +614,16 @@ function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: stri
 
 CORE DIRECTIVE: Every answer MUST cite the exact Rule ID first, then give the answer. Never give an answer without its rule reference. If the context contains the answer, you will find it — look carefully before saying you cannot answer.
 
-CITATION FORMAT: Always inline cite as [T3.14] or [EV.5.2] immediately after the relevant statement. Lead with the rule, not a preamble.`;
+CITATION FORMAT: Always inline cite as [T.3.14] or [EV.5.2] immediately after the relevant statement. Lead with the rule, not a preamble.`;
 
   const formatRules = `
 OUTPUT FORMAT (strictly follow):
-- **First line**: Bold one-sentence direct answer + the primary rule ID inline. Example: **The minimum cockpit opening width is 300 mm [T2.4.1].**
+- **First line**: Bold one-sentence direct answer + the primary rule ID inline. Example: **The minimum cockpit opening width is 300 mm [T.2.4.1].**
 - Then expand with supporting details, each sentence citing its rule ID.
 - Use ## headers only if the answer genuinely spans multiple distinct sub-topics.
 - Bullet points for lists of constraints or steps.
 - NEVER say "Based on the provided context", "According to the regulations", or "I cannot find". Just answer from the rules given.
-- If multiple rules apply, cite all of them.
+- If multiple rules or connected graph rules apply, synthesize and cite all of them.
 - End with ⚡ INDRA NOTE only if there is a critical compliance trap or scrutineering tip.
 - Zero filler. Every word earns its place.`;
 
@@ -803,7 +650,7 @@ Answer directly. Cite rule IDs inline throughout. Use ## headers only for genuin
 
 DOMAIN: ${domain}
 
-REGULATION CONTEXT (these are the exact rules — answer from them directly):
+REGULATION CONTEXT (these are the exact rules and connected cross-references — answer from them directly):
 ${ruleContext}
 
 QUESTION: ${query}
@@ -811,163 +658,11 @@ QUESTION: ${query}
 Answer now. Start with the rule ID and the answer. No preamble.`;
 }
 
-function extractKeywordsFromQuery(query: string): string[] {
-  const keywordsMap: Record<string, string[]> = {
-    'brake': ['Braking'],        'pedal': ['Braking'],
-    'roll hoop': ['Safety', 'Chassis'], 'bulkhead': ['Chassis'],
-    'impact attenuator': ['Chassis'],   'aip': ['Chassis'],
-    'accumulator': ['Powertrain'], 'battery': ['Powertrain'], 'motor': ['Powertrain'],
-    'shutdown': ['Safety'],      'fire': ['Safety'],
-    'wing': ['Aerodynamics'],    'aero': ['Aerodynamics'],
-    'steering': ['Chassis'],     'suspension': ['Chassis'],
-  };
-  const q = query.toLowerCase();
-  const matched = new Set<string>();
-  for (const [kw, cats] of Object.entries(keywordsMap)) {
-    if (q.includes(kw)) cats.forEach(c => matched.add(c));
-  }
-  return Array.from(matched);
-}
-
-function buildModelMetadata(
-  model: ModelRecord,
-  cadNodes: CadNodeMatch[],
-  includeTags = true,
-): Record<string, unknown> {
-  return {
-    name:        model.name        ?? 'Unknown Model',
-    category:    model.category    ?? 'Uncategorized',
-    tags: includeTags && Array.isArray(model.model_rule_tags)
-      ? model.model_rule_tags.map(t => t.rule_id)
-      : [],
-    description: model.description ?? null,
-    fileSize:    model.file_size_mb ? `${model.file_size_mb} MB` : null,
-    cad_nodes:   cadNodes.map(n => ({
-      rule_id:         n.rule_id,
-      cad_node_name:   n.cad_node_name,
-      relevance_score: n.relevance_score ?? null,
-    })),
-  };
-}
-
-async function fetchModelById(
-  modelId: number,
-  requestId: string,
-): Promise<ModelRecord | null> {
-  try {
-    const { data, error } = await supabase
-      .from('fb_models')
-      .select('*, model_rule_tags(rule_id)')
-      .eq('id', modelId)
-      .single();
-
-    if (error || !data) {
-      logger.warn(`[CAD] fetchModelById: no model found for id=${modelId}`, { requestId });
-      return null;
-    }
-    return data as ModelRecord;
-  } catch (err) {
-    logger.error('fetchModelById threw', err, { requestId });
-    return null;
-  }
-}
-
-async function fetchCadNodesForRules(
-  ruleIds: string[],
-  requestId: string,
-): Promise<CadNodeMatch[]> {
-  if (ruleIds.length === 0) return [];
-  try {
-    const { data, error } = await supabase.rpc('match_cad_nodes_by_prefix', { rule_ids: ruleIds });
-    if (error) { logger.error('match_cad_nodes_by_prefix RPC error', error, { requestId }); return []; }
-    return (data ?? []) as CadNodeMatch[];
-  } catch (err) {
-    logger.error('fetchCadNodesForRules threw', err, { requestId });
-    return [];
-  }
-}
-
-async function fetchCadByKeyword(
-  query: string,
-  requestId: string,
-): Promise<CadKeywordMatch | null> {
-  try {
-    const { data, error } = await supabase
-      .from('cad_keyword_map')
-      .select('model_id, keyword, highlight_meshes, context_meshes');
-
-    if (error || !data) return null;
-
-    const lowerQuery = query.toLowerCase();
-
-    const match = data
-      .sort((a, b) => b.keyword.length - a.keyword.length)
-      .find(row => lowerQuery.includes(row.keyword.toLowerCase()));
-
-    if (!match) return null;
-
-    return {
-      model_id:         match.model_id,
-      highlight_meshes: match.highlight_meshes,
-      context_meshes:   match.context_meshes,
-    };
-  } catch (err) {
-    logger.error('fetchCadByKeyword threw', err, { requestId });
-    return null;
-  }
-}
-
 // ============================================================================
 // ── 14. MIDDLEWARE
 // ============================================================================
 
-// ── AUTH BYPASSED FOR DEV — all requests get a dev user ─────────────────────
 async function requireAuth(req: Request, _res: Response, next: NextFunction): Promise<void> {
-  /*
-  // ── ORIGINAL AUTH (commented out for dev) ─────────────────────────────────
-  // const authHeader = req.headers['authorization'];
-  // const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  //
-  // if (!token) {
-  //   res.status(401).json({ error: 'Unauthorized: No token provided.', code: 'NO_TOKEN' });
-  //   return;
-  // }
-  //
-  // const validToken = process.env.API_AUTH_TOKEN!;
-  // const tokenBuf   = Buffer.from(token);
-  // const validBuf   = Buffer.from(validToken);
-  // if (tokenBuf.length === validBuf.length && crypto.timingSafeEqual(tokenBuf, validBuf)) {
-  //   (req as AuthenticatedRequest).requestId = crypto.randomUUID();
-  //   (req as AuthenticatedRequest).user = { role: 'admin' };
-  //   return next();
-  // }
-  //
-  // try {
-  //   const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-  //   if (authError || !user) {
-  //     res.status(401).json({ error: 'Unauthorized: Invalid or expired session.', code: 'INVALID_TOKEN' });
-  //     return;
-  //   }
-  //   const { data: teamMember, error: dbError } = await supabase
-  //     .from('INDRA_USERS')
-  //     .select('is_approved, email')
-  //     .eq('id', user.id)
-  //     .single();
-  //   if (dbError || !teamMember || teamMember.is_approved === false) {
-  //     res.status(403).json({ error: 'Your account is pending team lead approval.', code: 'ACCOUNT_PENDING' });
-  //     return;
-  //   }
-  //   (req as AuthenticatedRequest).requestId = crypto.randomUUID();
-  //   (req as AuthenticatedRequest).user = { id: user.id, email: teamMember.email };
-  //   next();
-  // } catch (err) {
-  //   logger.error('Authentication error', err);
-  //   res.status(500).json({ error: 'Authentication system error.', code: 'AUTH_ERROR' });
-  // }
-  // ── END ORIGINAL AUTH ─────────────────────────────────────────────────────
-  */
-
-  // DEV BYPASS — assign a default dev user, skip all token checks
   (req as AuthenticatedRequest).requestId = crypto.randomUUID();
   (req as AuthenticatedRequest).user = { id: 'dev-user', email: 'dev@local', role: 'admin' };
   logger.warn('[DEV] Auth bypassed — using dev user');
@@ -1002,64 +697,21 @@ app.use(cors({
 // ── 15. ROUTES
 // ============================================================================
 
+// ============================================================================
+// ── 15. ROUTES
+// ============================================================================
+
 app.get('/health', (_req: Request, res: Response): void => {
-  const now = Date.now();
-
-  const geminiRosterSummary = (roster: ModelSlot[]) => ({
-    total:   roster.length,
-    active:  roster.filter(s => s.coolUntil <= now).length,
-    cooling: roster.filter(s => s.coolUntil > now).length,
-  });
-
-  const openRouterRosterSummary = {
-    total:   openRouterRoster.length,
-    active:  openRouterRoster.filter(s => s.coolUntil <= now).length,
-    cooling: openRouterRoster.filter(s => s.coolUntil > now).length,
-  };
-
   res.json({
     status: 'ok',
-    service: 'INDRA RAG Backend',
-    version: '14.0.0-dev',
+    service: 'INDRA GraphRAG Backend',
+    version: '15.1.0-graph-dev',
     auth_mode: 'BYPASSED (dev)',
     cad_layer: 'PARTIALLY DISCONNECTED (dev)',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
-    openrouter_roster: openRouterRosterSummary,
-    primary_roster:    geminiRosterSummary(primaryRoster),
-    rerank_roster:     geminiRosterSummary(rerankRoster),
-  });
-});
-
-app.get('/admin/keys', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
-  const now = Date.now();
-
-  const geminiRosterStatus = (roster: ModelSlot[]) =>
-    roster.map(s => ({
-      label:        s.label,
-      model:        s.modelName,
-      status:       s.coolUntil > now ? 'cooling' : 'active',
-      coolUntil:    s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
-      quotaHits:    s.quotaHits,
-      successCount: s.successCount,
-    }));
-
-  const openRouterRosterStatus = openRouterRoster.map(s => ({
-    label:        s.label,
-    model:        s.modelName,
-    status:       s.coolUntil > now ? 'cooling' : 'active',
-    coolUntil:    s.coolUntil > now ? new Date(s.coolUntil).toISOString() : null,
-    quotaHits:    s.quotaHits,
-    successCount: s.successCount,
-  }));
-
-  res.json({
-    generation_chain:  'OpenRouter #1 → OpenRouter #2 → Gemini primary → Gemini rerank key',
-    rerank_chain:      'Cohere rerank-v3.5 → Gemini rerank roster → cosine similarity',
-    openrouter_roster: openRouterRosterStatus,
-    primary_roster:    geminiRosterStatus(primaryRoster),
-    rerank_roster:     geminiRosterStatus(rerankRoster),
-    note: 'Models are tried in order. A cooled model is skipped until its cooldown expires.',
+    active_models: GEMINI_MODELS,
+    gemini_keys_loaded: geminiClients.length,
   });
 });
 
@@ -1069,9 +721,13 @@ app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Respon
   for (const entry of semanticCache.values()) {
     entry.expiresAt > now ? active++ : expired++;
   }
-  res.json({ total_entries: semanticCache.size, active, expired, max_entries: CONFIG.CACHE_MAX_ENTRIES });
+  res.json({
+    total_entries: semanticCache.size,
+    active,
+    expired,
+    max_entries: CONFIG.CACHE_MAX_ENTRIES,
+  });
 });
-
 app.post('/admin/cache/invalidate', generalLimiter, requireAuth, (req: Request, res: Response): void => {
   const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
   const removed = invalidateCache(domain);
@@ -1086,7 +742,7 @@ app.post('/admin/cache/clear', generalLimiter, requireAuth, (_req: Request, res:
   res.json({ message: `Cleared ${cleared} cache entries.` });
 });
 
-// ── Main RAG endpoint ────────────────────────────────────────────────────────
+// ── Main GraphRAG endpoint ───────────────────────────────────────────────────
 app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const authReq   = req as AuthenticatedRequest;
   const requestId = authReq.requestId;
@@ -1124,23 +780,34 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
   try {
     const intent            = classifyIntent(trimmed);
+    const explicitRuleIds   = extractMentionedRuleIds(trimmed);
     const expandedEmbedding = await expandAndAverageEmbedding(trimmed);
-    logger.info('Query processed', { requestId, intent, domain: sanitizedDomain });
+    logger.info('Query processed', { requestId, intent, domain: sanitizedDomain, explicitRuleIds });
 
-    const cacheHit = findCacheHit(expandedEmbedding, sanitizedDomain);
+    const cacheHit = findCacheHit(expandedEmbedding, sanitizedDomain, explicitRuleIds);
     if (cacheHit) {
       logger.info('Cache hit', { requestId });
       res.json({ ...cacheHit, _cache: 'hit' });
       return;
     }
 
-    const { data: matchedRules, error: rpcError } = await supabase.rpc('match_rulebook_chunks', {
-      query_embedding: expandedEmbedding,
-      match_threshold: CONFIG.MATCH_THRESHOLD,
-      match_count:     CONFIG.MATCH_COUNT,
-      filter_domain:   sanitizedDomain,
+    // 1. Multi-rule hybrid vector + graph RPC
+    const { data: rawGraphRules, error: rpcError } = await supabase.rpc('match_multi_rules_with_graph', {
+      query_embedding:     expandedEmbedding,
+      explicit_rule_ids:   explicitRuleIds,
+      primary_match_count: CONFIG.MATCH_COUNT,
+      related_match_limit: CONFIG.GRAPH_RELATED_LIMIT,
     });
-    if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
+    if (rpcError) logger.error('match_multi_rules_with_graph RPC error', rpcError, { requestId });
+
+    const mappedRules: RuleChunk[] = ((rawGraphRules ?? []) as RawGraphRuleRow[]).map(r => ({
+      rule_id:            r.rule_id,
+      section:            r.section,
+      content:            r.rule_text,
+      relations_metadata: r.relations_metadata ?? [],
+      match_role:         r.match_role,
+      similarity:         r.similarity,
+    }));
 
     const [learnedMatches] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
@@ -1156,34 +823,24 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
           return [];
         }
       })(),
-      // ── 3D CAD keyword fetch — PARTIALLY DISCONNECTED (dev) ──────────────
-      // fetchCadByKeyword(trimmed, requestId),   // <-- disabled
       Promise.resolve(null),
     ]);
 
-    const rerankedRules: RuleChunk[] = matchedRules && (matchedRules as RuleChunk[]).length > 1
-      ? await rerankChunks(trimmed, matchedRules as RuleChunk[])
-      : (matchedRules ?? []) as RuleChunk[];
+    // 2. Keep explicitly mentioned rules locked at top; rerank semantic + graph-linked rules
+    const explicitLocked     = mappedRules.filter(r => r.match_role === 'explicit_primary');
+    const candidatesToRerank = mappedRules.filter(r => r.match_role !== 'explicit_primary');
+
+    const rerankedCandidates: RuleChunk[] = candidatesToRerank.length > 1
+      ? await rerankChunks(trimmed, candidatesToRerank)
+      : candidatesToRerank;
+
+    const rerankedRules: RuleChunk[] = [...explicitLocked, ...rerankedCandidates];
 
     const hasRuleMatches    = rerankedRules.length > 0;
     const hasLearnedMatches = learnedMatches.length > 0;
-    const ruleIds: string[] = rerankedRules
-      .map(r => r.rule_id)
-      .filter((id): id is string => Boolean(id));
-
-    // ── 3D Model resolution — PARTIALLY DISCONNECTED (dev) ──────────────────
-    const topModel: ModelRecord | null     = null;
-    const highlightMeshes: string[]        = [];
-    const contextMeshes: string[]          = [];
-    const cadNodes: CadNodeMatch[]         = [];
-
-    void topModel;
-    void ruleIds;
-    void extractKeywordsFromQuery;
-    void buildModelMetadata;
-    void fetchModelById;
-    void fetchCadNodesForRules;
-    void fetchCadByKeyword;
+    const highlightMeshes: string[] = [];
+    const contextMeshes: string[]   = [];
+    const cadNodes: CadNodeMatch[]  = [];
 
     logger.info('[CAD] 3D layer partially disconnected — meshes suppressed (dev mode)', { requestId });
 
@@ -1202,9 +859,24 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       return;
     }
 
-    // ── Generate answer ───────────────────────────────────────────────────────
+    // 3. Build enriched pre-prompt context with graph relationship explanations
     const ruleContext = [
-      ...rerankedRules.map(r => `[Rule ${r.rule_id}]\n${r.content}`),
+      ...rerankedRules.map(r => {
+        const roleTag =
+          r.match_role === 'explicit_primary'
+            ? ' [DIRECTLY CITED RULE]'
+            : r.match_role === 'graph_related'
+            ? ' [CONNECTED GRAPH RULE]'
+            : '';
+
+        const crossRefs = r.relations_metadata && r.relations_metadata.length > 0
+          ? `\nCross-References: ${r.relations_metadata
+              .map(rel => `${rel.relation_type} ${rel.target_rule_id} (${rel.context})`)
+              .join(' | ')}`
+          : '';
+
+        return `[Rule ${r.rule_id}${roleTag}]\n${r.content}${crossRefs}`;
+      }),
       ...(hasLearnedMatches
         ? ['\n--- PREVIOUSLY VERIFIED ANSWERS ---',
            ...learnedMatches.map(l => `Q: ${l.question}\nA: ${l.answer}`)]
@@ -1214,12 +886,13 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
     const answer       = await generate(systemPrompt, false, 0.35);
 
-    // ── Build response ────────────────────────────────────────────────────────
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
       citations: rerankedRules.map(r => ({
         rule_id:    r.rule_id,
+        section:    r.section ?? null,
+        match_role: r.match_role ?? 'vector_primary',
         content:    r.content,
         similarity: r.similarity,
       })),
@@ -1239,7 +912,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     responsePayload.context_meshes   = [];
     responsePayload.cad_nodes        = [];
 
-    writeCache(expandedEmbedding, sanitizedDomain, responsePayload);
+    writeCache(expandedEmbedding, sanitizedDomain, explicitRuleIds, responsePayload);
     res.json(responsePayload);
 
     void saveLog({
@@ -1262,7 +935,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
   } catch (error: unknown) {
     const msg              = error instanceof Error ? error.message : String(error);
-    const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED') || msg.includes('OPENROUTER_EXHAUSTED');
+    const isQuotaExhausted = msg.includes('QUOTA_EXHAUSTED');
     const isEmbedExhausted = msg.includes('EMBED_EXHAUSTED');
     const isTimeout        = msg.startsWith('TIMEOUT:') || msg.includes('EMBED_TIMEOUT');
 
@@ -1281,14 +954,14 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 });
 
 // ── Feedback & learning ──────────────────────────────────────────────────────
-const RULE_ID_RE = /\b([A-Z]{1,3}\d+(?:\.\d+){1,3})\b/;
+const RULE_ID_RE = /\b([A-Z]{1,3}\.?\d+(?:\.\d+){1,3})\b/;
 const URL_RE     = /\bhttps?:\/\/\S+/i;
 const CODE_RE    = /```|<code>|function\s*\(|class\s+\w+\s*[{:]/i;
 const ESC_RE     = /\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}/;
 
 function isValidLearnedPair(question: string, answer: string): { ok: boolean; reason?: string } {
   if (!RULE_ID_RE.test(answer)) {
-    return { ok: false, reason: 'answer must reference a rule ID (e.g. [T3.1.2])' };
+    return { ok: false, reason: 'answer must reference a rule ID (e.g. [T.3.1.2])' };
   }
   if (/^(i (can'?t|cannot|am unable)|as an? (ai|language model)|i don'?t have)/i.test(answer.trim())) {
     return { ok: false, reason: 'answer appears to be a refusal, not a rule citation' };
@@ -1422,7 +1095,7 @@ app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Re
   }
 });
 
-// ── Quiz generation ──────────────────────────────────────────────────────────
+// ── Quiz generation (pointed to formula_bharat_rules) ────────────────────────
 app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { domain = 'General', count = '3' } = req.query;
   const questionCount = Math.min(Math.max(Number(count) || 3, 1), 10);
@@ -1433,13 +1106,17 @@ app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response
   }
 
   try {
-    const { data: chunks } = await supabase
-      .from('rulebook_chunks')
-      .select('rule_id, content')
-      .eq('domain', domain as string)
+    const { data: rawChunks } = await supabase
+      .from('formula_bharat_rules')
+      .select('rule_id, rule_text')
       .limit(questionCount * 3);
 
-    if (!chunks || chunks.length === 0) {
+    const chunks = (rawChunks ?? []).map(c => ({
+      rule_id: c.rule_id,
+      content: c.rule_text,
+    }));
+
+    if (chunks.length === 0) {
       res.status(404).json({ error: 'No rulebook content found for this domain.', code: 'NOT_FOUND' });
       return;
     }
@@ -1493,4 +1170,54 @@ ${context}`;
         continue;
       }
       validQuestions.push({
-        question:    q.question
+        question:    q.question,
+        options:     q.options as string[],
+        explanation: typeof q.explanation === 'string' ? q.explanation : '',
+        rule_id:     typeof q.rule_id === 'string' ? q.rule_id : '',
+      });
+    }
+
+    if (validQuestions.length === 0) {
+      res.status(502).json({ error: 'Quiz generation produced no valid questions.', code: 'NO_VALID_QUESTIONS' });
+      return;
+    }
+
+    res.json({
+      questions: validQuestions,
+      domain,
+      generated: true,
+      _meta: { generated_count: validQuestions.length, requested_count: questionCount },
+    });
+  } catch (err) {
+    logger.error('Quiz generation error', err);
+    res.status(500).json({ error: 'Failed to generate quiz questions.', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// ============================================================================
+// ── 16. ERROR HANDLING & STARTUP
+// ============================================================================
+
+app.use((_req: Request, res: Response): void => {
+  res.status(404).json({ error: 'Route not found.', code: 'NOT_FOUND' });
+});
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void => {
+  logger.error('Unhandled error', error);
+  res.status(500).json({ error: 'Something went wrong. Please try again.', code: 'INTERNAL_ERROR' });
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🚀  INDRA GraphRAG Backend v15.1.0-graph-dev`);
+  console.log(`🌐  http://localhost:${PORT}`);
+  console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
+  console.log(`⚠️   Auth         : BYPASSED — all requests accepted as dev@local (admin)`);
+  console.log(`⚠️   3D Layer     : PARTIALLY DISCONNECTED — mesh data suppressed in responses`);
+  console.log(`🛡️   Security     : Helmet + Rate Limiting + Injection Guard (still active)`);
+  console.log(`🔑  Gemini keys  : ${geminiClients.length} key(s) loaded (${GEMINI_MODELS.join(' → ')})`);
+  console.log(`🔀  Rerank chain : Cohere rerank-v3.5 → Gemini fallback → cosine similarity`);
+  console.log(`🧠  Embed model  : nomic-embed-text-v1.5 (Nomic Atlas 768d)`);
+  console.log(`🕸️   Graph DB     : formula_bharat_rules (match_multi_rules_with_graph)`);
+  console.log(`⚡  Cache        : Semantic in-memory | TTL: ${CONFIG.CACHE_TTL_MS / 60000}min | Max: ${CONFIG.CACHE_MAX_ENTRIES} entries\n`);
+});
