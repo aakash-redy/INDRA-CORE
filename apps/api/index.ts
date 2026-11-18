@@ -300,7 +300,6 @@ const geminiClients = [
     client: new GoogleGenerativeAI(key),
   }));
 
-// Active 2026 production models
 const GEMINI_MODELS = [
   'gemini-4-hydrogen',
   'gemini-3.8-flash',
@@ -322,7 +321,10 @@ async function generate(
           generationConfig: {
             temperature,
             ...(requireJson ? { responseMimeType: 'application/json' } : {}),
-          },
+            ...(modelName.includes('hydrogen') || modelName.includes('3.8')
+              ? { thinkingConfig: { thinkingLevel: 'low' } }
+              : {}),
+          } as any,
         });
 
         const result = await withTimeout(
