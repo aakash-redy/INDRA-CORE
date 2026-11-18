@@ -297,86 +297,83 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // ── 7. GEMINI GENERATION ENGINE (Primary Key + Backup Key)
 // ============================================================================
 
-const geminiClients = [
-  process.env.GEMINI_API_KEY,
-  process.env.GEMINI_BACKUP_API_KEY, // Optional second key in .env
-]
-  .filter((key): key is string => Boolean(key))
-  .map((key, idx) => ({
-    label: idx === 0 ? 'GEMINI_PRIMARY' : 'GEMINI_BACKUP',
-    client: new GoogleGenerativeAI(key),
-  }));
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-const GEMINI_MODELS = [
-  'gemini-3.5-flash-lite',
-  'gemini-3.8-flash',
-  'gemini-4-hydrogen',
-] as const;
+// Primary synthesis chain (falls back server-side if any model spikes or 503s)
+const OPENROUTER_SYNTHESIS_MODELS = [
+  'anthropic/claude-haiku-4.5',
+  'google/gemini-2.5-flash',
+  'openai/gpt-4o-mini',
+];
+
+// Ultra-fast compression model
+const OPENROUTER_FAST_MODELS = [
+  'google/gemini-2.5-flash-lite',
+  'openai/gpt-4o-mini',
+];
+
+async function callOpenRouter(
+  prompt: string,
+  models: string[],
+  temperature: number,
+  requireJson = false,
+): Promise<string> {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('MISSING_KEY: OPENROUTER_API_KEY is not set in environment.');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.GEMINI_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(OPENROUTER_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://indra-fb.vercel.app',
+        'X-OpenRouter-Title': 'INDRA Formula Bharat',
+      },
+      body: JSON.stringify({
+        model: models[0],
+        models, // OpenRouter handles fallback automatically in one hop
+        temperature,
+        provider: { sort: 'latency' }, // Picks the fastest host
+        ...(requireJson ? { response_format: { type: 'json_object' } } : {}),
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(`OpenRouter ${res.status}: ${data?.error?.message || JSON.stringify(data)}`);
+    }
+
+    const answer = data.choices?.[0]?.message?.content ?? '';
+    logger.info(`[OPENROUTER] ${data.model || models[0]} via ${data.provider || 'auto'} ✓`, {
+      costUsd: data.usage?.cost,
+      tokens: data.usage?.total_tokens,
+    });
+
+    return answer;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function generate(
   prompt: string,
   requireJson = false,
-  temperature = 0.7,
+  temperature = 0.6,
 ): Promise<string> {
-  let lastError: unknown;
-
-  for (const slot of geminiClients) {
-    for (const modelName of GEMINI_MODELS) {
-      try {
-        const model = slot.client.getGenerativeModel({
-          model: modelName,
-          generationConfig: {
-            temperature,
-            ...(requireJson ? { responseMimeType: 'application/json' } : {}),
-            thinkingConfig: { thinkingBudget: 0 },
-          } as any,
-        });
-
-        const result = await withTimeout(
-          model.generateContent(prompt),
-          CONFIG.GEMINI_TIMEOUT_MS,
-          `${slot.label}/${modelName}`,
-        );
-
-        logger.info(`[AI] ${slot.label}/${modelName} ✓`);
-        return result.response.text();
-      } catch (err) {
-        lastError = err;
-        logger.warn(`[AI] ${slot.label}/${modelName} failed — trying next option.`, {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('QUOTA_EXHAUSTED: All configured Gemini models/keys failed.');
+  return callOpenRouter(prompt, OPENROUTER_SYNTHESIS_MODELS, temperature, requireJson);
 }
 
 async function generateFast(prompt: string, temperature = 0.1): Promise<string> {
-  for (const slot of geminiClients) {
-    try {
-      const model = slot.client.getGenerativeModel({
-        model: 'gemini-3.5-flash-lite',
-        generationConfig: { temperature },
-      });
-      const result = await withTimeout(
-        model.generateContent(prompt),
-        CONFIG.GEMINI_TIMEOUT_MS,
-        `${slot.label}/gemini-3.5-flash-lite`,
-      );
-      logger.info(`[COMPRESS] ${slot.label}/gemini-3.5-flash-lite ✓`);
-      return result.response.text();
-    } catch (err) {
-      logger.warn(`[COMPRESS] ${slot.label} failed — trying next key.`, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-  throw new Error('COMPRESS_FAILED');
+  return callOpenRouter(prompt, OPENROUTER_FAST_MODELS, temperature, false);
 }
-
 
 // ============================================================================
 // ── 10. EMBEDDINGS — Nomic Atlas
@@ -733,8 +730,8 @@ app.get('/health', (_req: Request, res: Response): void => {
     cad_layer: 'PARTIALLY DISCONNECTED (dev)',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
-    active_models: GEMINI_MODELS,
-    gemini_keys_loaded: geminiClients.length,
+    active_models: OPENROUTER_SYNTHESIS_MODELS,
+    openrouter_configured: Boolean(OPENROUTER_API_KEY),
   });
 });
 
@@ -1272,7 +1269,9 @@ app.listen(PORT, () => {
   console.log(`⚠️   Auth         : BYPASSED — all requests accepted as dev@local (admin)`);
   console.log(`⚠️   3D Layer     : PARTIALLY DISCONNECTED — mesh data suppressed in responses`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Injection Guard (still active)`);
-  console.log(`🔑  Gemini keys  : ${geminiClients.length} key(s) loaded (${GEMINI_MODELS.join(' → ')})`);
+  console.log(
+  `🔑  OpenRouter   : ${OPENROUTER_API_KEY ? 'configured' : 'MISSING'} (${OPENROUTER_SYNTHESIS_MODELS.join(' → ')})`
+);
   console.log(`🔀  Rerank chain : Cohere rerank-v3.5 → Gemini fallback → cosine similarity`);
   console.log(`🧠  Embed model  : nomic-embed-text-v1.5 (Nomic Atlas 768d)`);
   console.log(`🕸️   Graph DB     : formula_bharat_rules (match_multi_rules_with_graph)`);
