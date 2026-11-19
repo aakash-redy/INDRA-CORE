@@ -939,7 +939,80 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     ].join('\n\n');
 
     const systemPrompt = buildSystemPrompt(intent, ruleContext, trimmed, sanitizedDomain);
-    const answer       = await generate(systemPrompt, false, 0.6);
+    
+    let answer: string;
+
+    // === 6-MODEL PARALLEL BENCHMARK (Toggle via BENCHMARK_MODE=true in Render Env) ===
+    if (process.env.BENCHMARK_MODE === 'true') {
+      const BENCHMARK_CANDIDATES = [
+        'deepseek/deepseek-v4.1-flash-1017',
+        'z-ai/glm-5.3-flash',
+        'tencent/hy4-flash',
+        'anthropic/claude-haiku-4.5',
+        'google/gemini-2.5-flash',
+        'openai/gpt-4o-mini',
+      ];
+
+      const benchResults = await Promise.all(
+        BENCHMARK_CANDIDATES.map(async (model) => {
+          const t0 = Date.now();
+          try {
+            const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://indra-fb.vercel.app',
+                'X-OpenRouter-Title': 'INDRA 6-Model Benchmark',
+              },
+              body: JSON.stringify({
+                model,
+                temperature: 0.4,
+                provider: { sort: 'price' }, 
+                messages: [{ role: 'user', content: systemPrompt }],
+              }),
+            });
+
+            const sec = ((Date.now() - t0) / 1000).toFixed(2);
+            const data = await r.json();
+
+            if (!r.ok) {
+              return { model, provider: 'ERR', sec, cost: 'ERR', fullText: `ERROR ${r.status}: ${data?.error?.message || JSON.stringify(data)}` };
+            }
+
+            return {
+              model,
+              provider: data.provider ?? 'auto',
+              sec,
+              cost: data.usage?.cost != null ? `$${data.usage.cost.toFixed(6)}` : 'n/a',
+              fullText: data.choices?.[0]?.message?.content ?? '',
+            };
+          } catch (err) {
+            return { model, provider: 'ERR', sec: ((Date.now() - t0) / 1000).toFixed(2), cost: 'ERR', fullText: `EXCEPTION: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        }),
+      );
+
+      console.log(`\n================ INDRA 6-MODEL BENCHMARK ================`);
+      console.log(`QUESTION: ${trimmed}`);
+      console.log(`RETRIEVED RULES: ${rerankedRules.map(r => r.rule_id).join(', ')}`);
+      console.log(`---------------------------------------------------------`);
+      for (const item of benchResults) {
+        console.log(`[SUMMARY] ${item.model} | Provider: ${item.provider} | Time: ${item.sec}s | Cost: ${item.cost}`);
+      }
+      console.log(`=========================================================\n`);
+
+      for (const item of benchResults) {
+        console.log(`>>> MODEL: ${item.model} (${item.sec}s | ${item.cost}) <<<\n${item.fullText}\n---------------------------------------------------------`);
+      }
+
+      answer = benchResults.find((r) => r.cost !== 'ERR')?.fullText || 'All benchmark models failed — check Render logs.';
+    } else {
+      // Normal production flow
+      answer = await generate(systemPrompt, false, 0.6);
+    }
+    // === END BENCHMARK BLOCK ===
+
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
