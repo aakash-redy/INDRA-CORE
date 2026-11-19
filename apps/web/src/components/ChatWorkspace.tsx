@@ -1,1140 +1,554 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import {
-  Send, ShieldCheck, Trash2, Copy, Plus,
-  MessageSquare, BrainCircuit, CheckCircle2, XCircle,
-  ChevronRight, Menu, X,
-  Box, Maximize2, Download, ZoomIn, ZoomOut, RotateCw,
-  Eye, EyeOff, Play,
-  Target, Activity, Zap, Loader2, Ruler,
-  Crosshair, Minimize2, Layers, RefreshCw, AlertCircle
+  ArrowUp, Copy, Check, Box, Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCw,
+  X, Plus, AlertCircle, Loader2, ChevronDown,
 } from "lucide-react";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TYPE DECLARATIONS
+// TYPES & CONFIG (backend contract unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      'model-viewer': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
-        src?: string | null;
-        alt?: string;
-        'auto-rotate'?: boolean | string;
-        'camera-controls'?: boolean | string;
-        'shadow-intensity'?: string | number;
-        'environment-image'?: string;
-        exposure?: string | number;
-        loading?: string;
-        class?: string;
-        style?: React.CSSProperties;
-        ref?: any;
-        crossorigin?: string;
-        bounds?: string;
-        'touch-action'?: string;
-        'camera-orbit'?: string;
-        'min-camera-orbit'?: string;
-        zoom?: (amount: number) => void;
-        resetTurntableRotation?: () => void;
-      };
+      "model-viewer": any;
     }
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────────────────────────────────────
-const getEnvVar = (key: string, fallback = '') => (import.meta as any).env?.[key] || fallback;
-const API_URL = getEnvVar('VITE_API_URL', 'http://localhost:8000');
+const getEnvVar = (key: string, fallback = "") => (import.meta as any).env?.[key] || fallback;
+const API_URL = getEnvVar("VITE_API_URL", "http://localhost:8000");
 const MAX_MESSAGE_LENGTH = 1000;
-const RATE_LIMIT_DELAY = 1000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TYPES
-// ─────────────────────────────────────────────────────────────────────────────
 interface Citation { rule_id: string; content: string; }
 interface CadNode { rule_id: string; cad_node_name: string; relevance_score?: number; }
-interface ModelMetadata {
-  name: string;
-  category: string;
-  tags: string[];
-  description?: string;
-  fileSize?: string;
-  cad_nodes?: CadNode[];
-}
+interface ModelMetadata { name: string; category: string; tags: string[]; description?: string; fileSize?: string; cad_nodes?: CadNode[]; }
 interface Message {
-  id: string;
-  role: "user" | "bot" | "error";
-  text: string;
-  citations?: Citation[];
-  model_url?: string;
-  model_metadata?: ModelMetadata;
-  cad_nodes?: CadNode[];
-  highlight_meshes?: string[];
-  context_meshes?: string[];
-  timestamp: number;
+  id: string; role: "user" | "bot" | "error"; text: string; citations?: Citation[];
+  model_url?: string; model_metadata?: ModelMetadata; cad_nodes?: CadNode[];
+  highlight_meshes?: string[]; context_meshes?: string[]; timestamp: number;
+  retryText?: string;
 }
-interface QuizQuestion { question: string; options: string[]; correctAnswer: number; explanation: string; }
-type FocusedPanel = null | 'sidebar' | 'chat' | '3d';
-type IsolationMode = 'ghost' | 'hidden';
+type IsolationMode = "ghost" | "hidden";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DATA & CONSTANTS
-// ─────────────────────────────────────────────────────────────────────────────
-const QUIZ_QUESTIONS: QuizQuestion[] = [
-  {
-    question: "What is the minimum required force that the brake pedal system must be designed to withstand without failure?",
-    options: ["1000 N", "1500 N", "2000 N", "2500 N"],
-    correctAnswer: 2,
-    explanation: "Rule T6.1.13: The brake pedal and its mounting must be designed to withstand a force of 2000 N without yielding."
-  },
-  {
-    question: "Which material is strictly prohibited for use in the primary structure's main roll hoop?",
-    options: ["Carbon Steel", "Aluminum Alloy", "Titanium", "Chromoly"],
-    correctAnswer: 1,
-    explanation: "Rule T3.2.1: Aluminum alloys are not permitted for the Main Roll Hoop or Front Roll Hoop."
-  },
-  {
-    question: "What is the required color for the Cockpit Master Switch (Shutdown Button)?",
-    options: ["Red", "Blue with Red outline", "Red with a Yellow background", "Black with a Red outline"],
-    correctAnswer: 2,
-    explanation: "Rule EV4.3.3: All shutdown buttons must be Red, mounted on a Yellow background for high visibility."
-  }
+// Ambient opening animation: scattered questions a student asks while reading a rulebook.
+// x/y are % of the screen, r is tilt in degrees, o is resting opacity, m = also show on mobile.
+type Floater = { t: string; x: number; y: number; r: number; s: number; o: number; kind: "key" | "code" | "q" | "mark"; m?: boolean };
+const FLOATERS: Floater[] = [
+  { t: "why?", x: 7, y: 16, r: -8, s: 46, o: 0.9, kind: "key", m: true },
+  { t: "when?", x: 62, y: 11, r: 5, s: 42, o: 0.9, kind: "key", m: true },
+  { t: "what()?", x: 3, y: 45, r: -3, s: 36, o: 0.85, kind: "code" },
+  { t: "what?()", x: 74, y: 43, r: 4, s: 36, o: 0.85, kind: "code" },
+  { t: "when?", x: 36, y: 74, r: -5, s: 40, o: 0.9, kind: "key", m: true },
+  { t: "Why is the wall 1.5 mm?", x: 22, y: 29, r: -6, s: 15, o: 0.9, kind: "q", m: true },
+  { t: "Which rule applies here?", x: 66, y: 28, r: 4, s: 15, o: 0.9, kind: "q" },
+  { t: "Is this even legal?", x: 10, y: 62, r: 7, s: 15, o: 0.9, kind: "q", m: true },
+  { t: "Where do I measure from?", x: 62, y: 63, r: -5, s: 15, o: 0.9, kind: "q", m: true },
+  { t: "Does this need a drawing?", x: 44, y: 22, r: 3, s: 14, o: 0.8, kind: "q" },
+  { t: "Who checks this at tech inspection?", x: 18, y: 82, r: -3, s: 14, o: 0.8, kind: "q" },
+  { t: "Minimum or maximum?", x: 70, y: 79, r: 5, s: 14, o: 0.8, kind: "q" },
+  { t: "?", x: 38, y: 14, r: 12, s: 22, o: 0.7, kind: "mark" },
+  { t: "( )", x: 82, y: 71, r: -10, s: 26, o: 0.7, kind: "mark" },
+  { t: "?!", x: 52, y: 56, r: -14, s: 22, o: 0.6, kind: "mark" },
+  { t: "( \\", x: 6, y: 78, r: 8, s: 26, o: 0.7, kind: "mark", m: true },
 ];
 
-const QUICK_QUERIES = [
-  { label: "Front impact structure specs", icon: <ShieldCheck size={13} /> },
-  { label: "Roll hoop material constraints", icon: <Target size={13} /> },
-  { label: "Brake pedal force limits", icon: <Activity size={13} /> },
-  { label: "IA foam dimensions", icon: <Ruler size={13} /> },
-];
+// Deterministic per-item motion. Negative delays start each word mid-cycle, so the screen is never empty on load.
+const motion = (i: number) => ({
+  dur: 9 + ((i * 37) % 7),
+  delay: -0.8 * i,
+  dx: ((i * 53) % 40) - 20,
+  dy: ((i * 29) % 40) - 20,
+  dr: ((i * 11) % 15) - 7,
+});
+// Design tokens — one place to retune the whole look
+const T = {
+  bg: "#FBFBFD", ink: "#1D1D1F", mute: "#6E6E73", line: "#E8E8ED",
+  fill: "#F2F2F7", accent: "#0A64D8",
+};
+// model-viewer expects linear 0-1 RGBA
+const HIGHLIGHT: [number, number, number, number] = [0.04, 0.39, 0.85, 1.0];
 
-const sanitizeInput = (s: string) => s.trim().slice(0, MAX_MESSAGE_LENGTH);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RENDER TEXT WITH CITATIONS
-// ─────────────────────────────────────────────────────────────────────────────
-function renderTextWithCitations(text: string, citations?: Citation[]): React.ReactNode {
-  if (!citations || citations.length === 0) return <span>{text}</span>;
-  const ruleIndex = new Map<string, number>();
-  citations.forEach((c, i) => ruleIndex.set(c.rule_id, i + 1));
-  const parts = text.split(/\[CITE:([^\]]+)\]/g);
-  return (
-    <>
-      {parts.map((part, i) => {
-        if (i % 2 === 0) return <span key={i}>{part}</span>;
-        const ruleId = part;
-        const num = ruleIndex.get(ruleId) ?? '?';
-        const citation = citations.find(c => c.rule_id === ruleId);
-        return (
-          <span
-            key={i}
-            title={citation ? `${ruleId}: ${citation.content}` : ruleId}
-            className="inline-flex items-center justify-center w-4 h-4 mx-0.5 rounded-sm bg-[#FF2800] text-white text-[8px] font-black cursor-help align-middle leading-none"
-          >
-            {num}
-          </span>
-        );
-      })}
-    </>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// REUSABLE COMPONENTS
-// ─────────────────────────────────────────────────────────────────────────────
-function FocusButton({ panel, focusedPanel, onToggle }: { panel: FocusedPanel; focusedPanel: FocusedPanel; onToggle: (p: FocusedPanel) => void; }) {
-  const isActive = focusedPanel === panel;
-  return (
-    <button
-      onClick={() => onToggle(isActive ? null : panel)}
-      title={isActive ? "Exit Focus Mode" : "Focus this panel"}
-      className={`relative overflow-hidden flex items-center gap-1.5 px-3 py-2 md:px-2.5 md:py-1.5 text-[8px] font-black tracking-[0.25em] uppercase border transition-all duration-300 group
-        ${isActive ? 'bg-[#FF2800] border-[#FF2800] text-white shadow-[0_0_16px_rgba(255,40,0,0.45)]' : 'bg-transparent border-white/[0.08] text-slate-600 hover:border-[#FF2800]/40 hover:text-[#FF2800]/80'}`}
-    >
-      <span className="absolute inset-0 bg-white/10 translate-x-[-110%] group-hover:translate-x-[110%] transition-transform duration-500 skew-x-12 pointer-events-none" />
-      {isActive ? <Minimize2 size={9} className="shrink-0" /> : <Crosshair size={9} className="shrink-0" />}
-      <span className="relative z-10 hidden md:inline">{isActive ? 'EXIT' : 'FOCUS'}</span>
-    </button>
-  );
-}
-
-function PanelShell({ id, focusedPanel, children, className = '' }: { id: FocusedPanel; focusedPanel: FocusedPanel; children: React.ReactNode; className?: string; }) {
-  const isFocused = focusedPanel === id;
-  const isDimmed = focusedPanel !== null && !isFocused;
-  return (
-    <div className={`transition-all duration-500 ease-out relative ${isDimmed ? 'opacity-[0.15] blur-[2px] pointer-events-none saturate-0' : 'opacity-100 blur-0 pointer-events-auto saturate-100'} ${isFocused ? 'ring-1 ring-[#FF2800]/20 shadow-[0_0_40px_rgba(255,40,0,0.06)] z-10' : ''} ${className}`}>
-      {children}
-    </div>
-  );
-}
-
-function TelemetryStrip() {
-  const [tick, setTick] = useState(0);
-  useEffect(() => { const id = setInterval(() => setTick(t => t + 1), 1200); return () => clearInterval(id); }, []);
-  const rpm = (6800 + Math.sin(tick * 0.7) * 800).toFixed(0);
-  const temp = (92 + Math.sin(tick * 0.3) * 4).toFixed(1);
-  const voltage = (396 + Math.sin(tick * 0.5) * 3).toFixed(1);
-  return (
-    <div className="hidden md:flex items-center gap-6 text-[9px] font-mono tracking-widest text-slate-500 select-none">
-      <span className="flex items-center gap-1.5"><span className="text-[#FF2800]">RPM</span> {rpm}</span><span className="w-px h-3 bg-white/10" />
-      <span className="flex items-center gap-1.5"><span className="text-[#FF2800]">TEMP</span> {temp}°C</span><span className="w-px h-3 bg-white/10" />
-      <span className="flex items-center gap-1.5"><span className="text-[#FF2800]">HV</span> {voltage}V</span><span className="w-px h-3 bg-white/10" />
-      <span className="flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-[#FF2800] animate-pulse shadow-[0_0_6px_#FF2800]" /><span className="text-[#FF2800]">LIVE</span></span>
-    </div>
-  );
-}
-
-function Scanlines() {
-  return <div className="pointer-events-none absolute inset-0 z-0 opacity-[0.025]" style={{ backgroundImage: 'repeating-linear-gradient(to bottom, transparent, transparent 2px, rgba(255,255,255,0.4) 2px, rgba(255,255,255,0.4) 4px)' }} />;
-}
-
-function Toast({ message, type, onClose }: { message: string; type: 'error' | 'success'; onClose: () => void }) {
-  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
-  return (
-    <div className={`fixed bottom-6 right-6 z-[100] flex items-center gap-3 px-4 py-3 text-xs font-bold shadow-2xl border animate-in slide-in-from-bottom-4 duration-300
-      ${type === 'error' ? 'bg-red-950 border-red-700/50 text-red-300' : 'bg-green-950 border-green-700/50 text-green-300'}`}>
-      {type === 'error' ? <AlertCircle size={14} /> : <CheckCircle2 size={14} />}
-      {message}
-      <button onClick={onClose} className="ml-2 opacity-60 hover:opacity-100"><X size={12} /></button>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MESH MATCHING UTILITY
-// ─────────────────────────────────────────────────────────────────────────────
-function matchesMeshName(matName: string, targets: string[]): boolean {
-  if (targets.length === 0) return false;
-  const clean = (s: string) => s.toLowerCase().replace(/[_\-\s]/g, '');
-  const cleanMat = clean(matName);
-  return targets.some(target => {
-    const cleanTarget = clean(target);
-    return (
-      matName === target ||
-      matName.toLowerCase() === target.toLowerCase() ||
-      cleanMat === cleanTarget ||
-      cleanMat.includes(cleanTarget) ||
-      cleanTarget.includes(cleanMat)
-    );
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN APPLICATION — NO AUTH GATE
-// ─────────────────────────────────────────────────────────────────────────────
 export default function IndraWorkspace() {
-  // App State
-  const [appMode, setAppMode] = useState<"ask" | "quiz">("ask");
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [focusedPanel, setFocusedPanel] = useState<FocusedPanel>(null);
-  const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
-
-  const toggleFocus = useCallback((panel: FocusedPanel) => setFocusedPanel(prev => prev === panel ? null : panel), []);
-  const showToast = useCallback((message: string, type: 'error' | 'success') => setToast({ message, type }), []);
-
-  // Chat State
+  // ── Chat state ──
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isThinking, setIsThinking] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
-  const [lastMessageTime, setLastMessageTime] = useState(0);
+  const [openCite, setOpenCite] = useState<{ msg: string; rule: string } | null>(null);
 
-  // 3D State
+  // ── 3D state ──
   const [activeModelUrl, setActiveModelUrl] = useState<string | null>(null);
   const [activeModelMetadata, setActiveModelMetadata] = useState<ModelMetadata | null>(null);
-  const [activeCadNodes, setActiveCadNodes] = useState<CadNode[]>([]);
-  const [modelParts, setModelParts] = useState<string[]>([]);
   const [highlightMeshes, setHighlightMeshes] = useState<string[]>([]);
   const [contextMeshes, setContextMeshes] = useState<string[]>([]);
   const [isolatedParts, setIsolatedParts] = useState<string[]>([]);
-  const [highlightSelected, setHighlightSelected] = useState(true);
-  const [isolationMode, setIsolationMode] = useState<IsolationMode>('ghost');
+  const [isolationMode, setIsolationMode] = useState<IsolationMode>("ghost");
   const [isModelLoading, setIsModelLoading] = useState(false);
-  const [modelLoadProgress, setModelLoadProgress] = useState(0);
   const [is3DFullscreen, setIs3DFullscreen] = useState(false);
-  const [showModelInfo, setShowModelInfo] = useState(true);
-  const [autoRotateEnabled, setAutoRotateEnabled] = useState(true);
-  const [showDebug, setShowDebug] = useState(false);
+  const [showPanel, setShowPanel] = useState(true);
 
-  // Quiz State
-  const [qIndex, setQIndex] = useState(0);
-  const [selectedAns, setSelectedAns] = useState<number | null>(null);
-  const [isAnsChecked, setIsAnsChecked] = useState(false);
-  const [quizScore, setQuizScore] = useState(0);
-  const [quizFinished, setQuizFinished] = useState(false);
-  const [scoreCounted, setScoreCounted] = useState(false);
-
-  // Refs
+  // ── Refs ──
   const bottomRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
   const modelViewerRef = useRef<any>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const originalMaterialsRef = useRef<Map<string, number[]>>(new Map());
-  const handle3DModelLoadRef = useRef<Function | null>(null);
 
-  // ── Effects ──
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, isThinking]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [messages, isThinking]);
 
+  // Auto-grow composer
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') setFocusedPanel(null); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, []);
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  }, [input]);
+
+  // Esc closes the viewer (fullscreen first, then the viewer itself)
+  useEffect(() => {
+    if (!activeModelUrl) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (is3DFullscreen) setIs3DFullscreen(false);
+      else setActiveModelUrl(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeModelUrl, is3DFullscreen]);
 
   // ─────────────────────────────────────────────────────────────────────────
-  // CORE 3D MATERIAL LOGIC
+  // 3D MATERIAL LOGIC (same behaviour as before)
   // ─────────────────────────────────────────────────────────────────────────
+  const matchesMeshName = (matName: string, targets: string[]) => {
+    if (targets.length === 0) return false;
+    const clean = (s: string) => s.toLowerCase().replace(/[_\-\s]/g, "");
+    const cleanMat = clean(matName);
+    return targets.some(t => cleanMat.includes(clean(t)) || clean(t).includes(cleanMat));
+  };
+
   const applyMeshStates = useCallback(() => {
     const mv = modelViewerRef.current;
     if (!mv?.model?.materials) return;
-    const materials = mv.model.materials;
     const activeTargets = isolatedParts.length > 0 ? isolatedParts : highlightMeshes;
-    const siblingTargets = isolatedParts.length > 0
-      ? highlightMeshes.filter(m => !isolatedParts.includes(m))
-      : [];
+    const siblingTargets = isolatedParts.length > 0 ? highlightMeshes.filter(m => !isolatedParts.includes(m)) : [];
 
-    materials.forEach((mat: any, index: number) => {
-      const matName = mat.name || `Unnamed_Material_${index}`;
+    mv.model.materials.forEach((mat: any, i: number) => {
+      const matName = mat.name || `Unnamed_Material_${i}`;
       mat.name = matName;
-      const original = originalMaterialsRef.current.get(matName) ?? [0.7, 0.7, 0.7, 1.0];
-      const isActive = matchesMeshName(matName, activeTargets);
-      const isSibling = matchesMeshName(matName, siblingTargets);
-      const isContext = matchesMeshName(matName, contextMeshes);
-
-      if (isActive) {
-        if (highlightSelected) {
-          mat.pbrMetallicRoughness.setBaseColorFactor([1.0, 0.22, 0.08, 1.0]);
-          mat.pbrMetallicRoughness.setMetallicFactor(0.2);
-          mat.pbrMetallicRoughness.setRoughnessFactor(0.25);
-        } else {
-          mat.pbrMetallicRoughness.setBaseColorFactor([...original]);
-          mat.pbrMetallicRoughness.setMetallicFactor(0.3);
-          mat.pbrMetallicRoughness.setRoughnessFactor(0.2);
-        }
-        mat.setAlphaMode('OPAQUE');
-      } else if (isSibling) {
-        mat.pbrMetallicRoughness.setBaseColorFactor([1.0, 0.22, 0.08, 0.35]);
-        mat.pbrMetallicRoughness.setMetallicFactor(0.4);
-        mat.pbrMetallicRoughness.setRoughnessFactor(0.3);
-        mat.setAlphaMode('BLEND');
-      } else if (isContext) {
-        mat.pbrMetallicRoughness.setBaseColorFactor([0.35, 0.38, 0.45, 0.12]);
-        mat.pbrMetallicRoughness.setMetallicFactor(0.9);
-        mat.pbrMetallicRoughness.setRoughnessFactor(0.05);
-        mat.setAlphaMode('BLEND');
+      if (matchesMeshName(matName, activeTargets)) {
+        mat.pbrMetallicRoughness.setBaseColorFactor(HIGHLIGHT);
+        mat.setAlphaMode("OPAQUE");
+      } else if (matchesMeshName(matName, siblingTargets)) {
+        mat.pbrMetallicRoughness.setBaseColorFactor([HIGHLIGHT[0], HIGHLIGHT[1], HIGHLIGHT[2], 0.4]);
+        mat.setAlphaMode("BLEND");
+      } else if (matchesMeshName(matName, contextMeshes)) {
+        mat.pbrMetallicRoughness.setBaseColorFactor([0.5, 0.5, 0.5, 0.15]);
+        mat.setAlphaMode("BLEND");
       } else {
-        if (isolationMode === 'hidden') {
-          mat.pbrMetallicRoughness.setBaseColorFactor([0, 0, 0, 0]);
-          mat.setAlphaMode('BLEND');
-        } else {
-          mat.pbrMetallicRoughness.setBaseColorFactor([0.1, 0.12, 0.18, 0.04]);
-          mat.pbrMetallicRoughness.setMetallicFactor(0.95);
-          mat.pbrMetallicRoughness.setRoughnessFactor(0.02);
-          mat.setAlphaMode('BLEND');
-        }
+        mat.pbrMetallicRoughness.setBaseColorFactor(isolationMode === "hidden" ? [0, 0, 0, 0] : [0.2, 0.2, 0.2, 0.05]);
+        mat.setAlphaMode("BLEND");
       }
     });
-    if (typeof mv.queueRender === 'function') mv.queueRender();
-  }, [isolatedParts, highlightSelected, highlightMeshes, contextMeshes, isolationMode]);
+  }, [isolatedParts, highlightMeshes, contextMeshes, isolationMode]);
 
-  useEffect(() => {
-    if (activeModelUrl) applyMeshStates();
-  }, [isolatedParts, highlightSelected, highlightMeshes, contextMeshes, isolationMode, applyMeshStates, activeModelUrl]);
+  useEffect(() => { if (activeModelUrl) applyMeshStates(); }, [applyMeshStates, activeModelUrl]);
 
   useEffect(() => {
     const mv = modelViewerRef.current;
     if (!mv) return;
-
     const handleModelReady = () => {
-      const materials = mv.model?.materials;
-      if (!materials) return;
-      const parts: string[] = [];
-      materials.forEach((mat: any, index: number) => {
-        const matName = mat.name || `Unnamed_Material_${index}`;
+      mv.model?.materials?.forEach((mat: any, i: number) => {
+        const matName = mat.name || `Unnamed_Material_${i}`;
         mat.name = matName;
-        parts.push(matName);
         if (!originalMaterialsRef.current.has(matName)) {
-          const color = mat.pbrMetallicRoughness?.baseColorFactor ?? [0.7, 0.7, 0.7, 1];
-          originalMaterialsRef.current.set(matName, [...color]);
+          originalMaterialsRef.current.set(matName, [...(mat.pbrMetallicRoughness?.baseColorFactor ?? [0.8, 0.8, 0.8, 1])]);
         }
       });
-      setModelParts(parts);
+      setIsModelLoading(false);
       applyMeshStates();
     };
-
-    const handleProgress = (e: any) => {
-      const pct = Math.round((e.detail?.totalProgress ?? 0) * 100);
-      setModelLoadProgress(pct);
-      if (pct >= 100) setIsModelLoading(false);
-    };
-
-    mv.addEventListener('load', handleModelReady);
-    mv.addEventListener('scene-graph-ready', handleModelReady);
-    mv.addEventListener('progress', handleProgress);
-    if (mv.model) handleModelReady();
-
+    const handleError = () => setIsModelLoading(false);
+    mv.addEventListener("load", handleModelReady);
+    mv.addEventListener("error", handleError);
     return () => {
-      mv.removeEventListener('load', handleModelReady);
-      mv.removeEventListener('scene-graph-ready', handleModelReady);
-      mv.removeEventListener('progress', handleProgress);
+      mv.removeEventListener("load", handleModelReady);
+      mv.removeEventListener("error", handleError);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeModelUrl]);
+  }, [activeModelUrl, applyMeshStates]);
 
-  useEffect(() => {
-    if (activeModelUrl) {
-      originalMaterialsRef.current.clear();
-      setModelParts([]);
-      setIsolatedParts([]);
-    }
-  }, [activeModelUrl]);
-
-  const copyToClipboard = useCallback(async (text: string, id: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(id);
-      setTimeout(() => setCopied(null), 2000);
-    } catch {
-      showToast('Failed to copy to clipboard', 'error');
-    }
-  }, [showToast]);
-
-  const handle3DModelLoad = useCallback((
-    url: string,
-    meta?: ModelMetadata,
-    nodes?: CadNode[],
-    highlights: string[] = [],
-    contexts: string[] = [],
-  ) => {
+  // ── Actions ──
+  const handle3DModelLoad = (url: string, meta?: ModelMetadata, highlights: string[] = [], contexts: string[] = []) => {
     originalMaterialsRef.current.clear();
     setActiveModelUrl(url);
     setActiveModelMetadata(meta ?? null);
-    setActiveCadNodes(nodes ?? []);
     setHighlightMeshes(highlights);
     setContextMeshes(contexts);
     setIsolatedParts([]);
-    setModelParts([]);
     setIsModelLoading(true);
-    setModelLoadProgress(0);
-  }, []);
+    setShowPanel(true);
+  };
 
-  useEffect(() => { handle3DModelLoadRef.current = handle3DModelLoad; }, [handle3DModelLoad]);
-
-  // ── Send Message ──
-  const sendMessage = useCallback(async (text: string) => {
-    const sanitized = sanitizeInput(text);
+  const sendMessage = async (text: string, isRetry = false) => {
+    const sanitized = text.trim().slice(0, MAX_MESSAGE_LENGTH);
     if (!sanitized || isThinking) return;
-    const now = Date.now();
-    if (now - lastMessageTime < RATE_LIMIT_DELAY) return;
-    setLastMessageTime(now);
-    setMessages(p => [...p, { id: crypto.randomUUID(), role: "user", text: sanitized, timestamp: now }]);
-    setInput("");
-    setIsThinking(true);
-
-    if (!isModelLoading) {
-      setActiveModelUrl(null);
-      setActiveModelMetadata(null);
-      setActiveCadNodes([]);
-      setHighlightMeshes([]);
-      setContextMeshes([]);
-      setIsolatedParts([]);
-      setModelParts([]);
+    if (isRetry) {
+      setMessages(p => p.filter(m => m.role !== "error"));
+    } else {
+      setMessages(p => [...p, { id: crypto.randomUUID(), role: "user", text: sanitized, timestamp: Date.now() }]);
     }
+    setInput("");
+    setOpenCite(null);
+    setIsThinking(true);
 
     try {
       const res = await fetch(`${API_URL}/ask_indra`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${getEnvVar('VITE_API_AUTH_TOKEN')}`,
-        },
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${getEnvVar("VITE_API_AUTH_TOKEN")}` },
         body: JSON.stringify({ message: sanitized, domain: "Formula Bharat 2027 Full" }),
       });
-      if (!res.ok) throw new Error(`Telemetry uplink failure: ${res.status}`);
+      if (!res.ok) throw new Error("Couldn't reach the rulebook service. Check your connection and try again.");
       const data = await res.json();
 
       setMessages(p => [...p, {
-        id: crypto.randomUUID(),
-        role: "bot",
-        text: data.answer,
-        citations: data.citations,
-        model_url: data.model_url,
-        model_metadata: data.model_metadata,
-        cad_nodes: data.cad_nodes,
-        highlight_meshes: data.highlight_meshes ?? [],
-        context_meshes: data.context_meshes ?? [],
-        timestamp: Date.now()
+        id: crypto.randomUUID(), role: "bot", text: data.answer, citations: data.citations,
+        model_url: data.model_url, model_metadata: data.model_metadata,
+        highlight_meshes: data.highlight_meshes ?? [], context_meshes: data.context_meshes ?? [], timestamp: Date.now(),
       }]);
 
-      if (data.model_url && handle3DModelLoadRef.current) {
-        handle3DModelLoadRef.current(
-          data.model_url,
-          data.model_metadata,
-          data.cad_nodes,
-          data.highlight_meshes ?? [],
-          data.context_meshes ?? [],
-        );
-      }
+      if (data.model_url) handle3DModelLoad(data.model_url, data.model_metadata, data.highlight_meshes, data.context_meshes);
     } catch (err: any) {
-      setMessages(p => [...p, { id: crypto.randomUUID(), role: "error", text: err.message, timestamp: Date.now() }]);
-      showToast(err.message, 'error');
+      setMessages(p => [...p, { id: crypto.randomUUID(), role: "error", text: err.message, retryText: sanitized, timestamp: Date.now() }]);
     } finally {
       setIsThinking(false);
-      inputRef.current?.focus();
     }
-  }, [isThinking, lastMessageTime, isModelLoading, showToast]);
+  };
 
-  const close3DModel = useCallback(() => {
-    setActiveModelUrl(null);
-    setActiveModelMetadata(null);
-    setActiveCadNodes([]);
-    setHighlightMeshes([]);
-    setContextMeshes([]);
-    setIsolatedParts([]);
-    setModelParts([]);
-    setIs3DFullscreen(false);
-    if (focusedPanel === '3d') setFocusedPanel(null);
-  }, [focusedPanel]);
-
-  const togglePartIsolation = useCallback((partName: string) => {
-    setIsolatedParts(prev =>
-      prev.includes(partName) ? prev.filter(p => p !== partName) : [...prev, partName]
-    );
-  }, []);
-
-  const clearIsolation = useCallback(() => { setIsolatedParts([]); }, []);
-
-  const downloadModel = useCallback(async () => {
-    if (!activeModelUrl) return;
+  const copyText = async (id: string, text: string) => {
     try {
-      const res = await fetch(activeModelUrl);
-      if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = activeModelMetadata?.name || 'model.glb';
-      document.body.appendChild(a);
-      a.click();
-      URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-      showToast('Model downloaded successfully', 'success');
-    } catch (err: any) {
-      showToast(`Download failed: ${err.message}`, 'error');
-    }
-  }, [activeModelUrl, activeModelMetadata, showToast]);
+      await navigator.clipboard.writeText(text.replace(/\[CITE:[^\]]+\]/g, ""));
+      setCopied(id);
+      setTimeout(() => setCopied(null), 1500);
+    } catch { /* clipboard unavailable */ }
+  };
 
-  const zoomIn = useCallback(() => modelViewerRef.current?.zoom(-1), []);
-  const zoomOut = useCallback(() => modelViewerRef.current?.zoom(1), []);
-  const reset3DCamera = useCallback(() => modelViewerRef.current?.resetTurntableRotation(), []);
+  const newChat = () => {
+    setMessages([]); setActiveModelUrl(null); setIs3DFullscreen(false); setOpenCite(null);
+    textareaRef.current?.focus();
+  };
 
-  const cleanPartName = (name: string): string =>
-    name
-      .replace(/_mat$/gi, '')
-      .replace(/^[0-9]+_/, '')
-      .replace(/_/g, ' ')
-      .replace(/\b\w/g, l => l.toUpperCase())
-      .trim() || name;
+  // Citations: tap/click to reveal the rule text (works on touch, unlike title tooltips)
+  const renderTextWithCitations = (msg: Message) => {
+    const { text, citations } = msg;
+    if (!citations?.length) return <p className="whitespace-pre-wrap">{text}</p>;
+    const parts = text.split(/\[CITE:([^\]]+)\]/g);
+    const active = openCite?.msg === msg.id ? citations.find(c => c.rule_id === openCite.rule) : undefined;
+    return (
+      <>
+        <p className="whitespace-pre-wrap">
+          {parts.map((part, i) => {
+            if (i % 2 === 0) return <span key={i}>{part}</span>;
+            const isOpen = openCite?.msg === msg.id && openCite.rule === part;
+            return (
+              <button
+                key={i}
+                onClick={() => setOpenCite(isOpen ? null : { msg: msg.id, rule: part })}
+                aria-expanded={isOpen}
+                aria-label={`Rule ${part}`}
+                className="indra-focus mx-0.5 px-1.5 rounded-md text-[12px] font-medium align-baseline transition-colors"
+                style={{ background: isOpen ? T.accent : "#E8F0FC", color: isOpen ? "#fff" : T.accent }}
+              >
+                {part}
+              </button>
+            );
+          })}
+        </p>
+        {active && (
+          <div className="indra-pop mt-3 rounded-xl px-4 py-3 text-[14px] leading-relaxed" style={{ background: T.fill, color: T.ink }}>
+            <div className="font-medium mb-1" style={{ color: T.mute }}>Rule {active.rule_id}</div>
+            {active.content}
+          </div>
+        )}
+      </>
+    );
+  };
 
-  const clearChat = useCallback(() => {
-    setMessages([]);
-    setActiveModelUrl(null);
-    setActiveModelMetadata(null);
-    setActiveCadNodes([]);
-    setHighlightMeshes([]);
-    setContextMeshes([]);
-    setIsolatedParts([]);
-    setModelParts([]);
-  }, []);
+  const hasViewer = !!activeModelUrl;
+  const splitView = hasViewer && !is3DFullscreen;
+  const partLabel = (p: string) => p.replace(/_mat$/gi, "").replace(/_/g, " ").trim();
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // MAIN WORKSPACE (always rendered — no auth gate)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-[100dvh] w-full overflow-hidden bg-[#060606] text-slate-200 relative select-none" style={{ fontFamily: "'Rajdhani', 'DIN Next', system-ui, sans-serif" }}>
-      <Scanlines />
-      <div className="absolute inset-0 opacity-[0.025] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,40,0,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(255,40,0,0.5) 1px, transparent 1px)', backgroundSize: '80px 80px' }} />
+    <div
+      className="flex h-[100dvh] w-full"
+      style={{ background: T.bg, color: T.ink, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', system-ui, sans-serif", letterSpacing: "-0.011em" }}
+    >
+      <style>{`
+        @keyframes indraRise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        @keyframes indraPop { from { opacity: 0; transform: scale(.98); } to { opacity: 1; transform: none; } }
+        @keyframes indraDot { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
+        @keyframes indraFloat {
+          0%   { opacity: 0; transform: translate(calc(var(--dx) * -2px), calc(var(--dy) * -2px)) rotate(calc(var(--r) - var(--dr))) scale(.7); }
+          7%   { opacity: var(--o); transform: translate(calc(var(--dx) * -1.9px), calc(var(--dy) * -1.9px)) rotate(var(--r)) scale(1.1); }
+          13%  { opacity: var(--o); transform: translate(calc(var(--dx) * -1.7px), calc(var(--dy) * -1.7px)) rotate(var(--r)) scale(1); }
+          86%  { opacity: var(--o); transform: translate(calc(var(--dx) * 1.5px), calc(var(--dy) * 1.5px)) rotate(calc(var(--r) + var(--dr))) scale(1); }
+          100% { opacity: 0; transform: translate(calc(var(--dx) * 2px), calc(var(--dy) * 2px)) rotate(calc(var(--r) + var(--dr))) scale(1.03); }
+        }
+        .indra-float { position: absolute; white-space: nowrap; pointer-events: none; user-select: none; opacity: 0;
+          animation: indraFloat var(--t) linear var(--d) infinite both; }
+        .indra-rise { animation: indraRise .28s ease-out both; }
+        .indra-pop { animation: indraPop .18s ease-out both; }
+        .indra-focus:focus-visible, .indra-btn:focus-visible { outline: 2px solid ${T.accent}; outline-offset: 2px; }
+        .indra-glass { background: rgba(255,255,255,.72); backdrop-filter: saturate(180%) blur(24px); -webkit-backdrop-filter: saturate(180%) blur(24px); }
+        @media (prefers-reduced-motion: reduce) { .indra-rise, .indra-pop { animation: none; } .indra-float { animation: none; opacity: var(--o); transform: rotate(var(--r)); } .indra-dot { animation: none !important; } }
+      `}</style>
 
-      {focusedPanel !== null && <div className="pointer-events-none fixed inset-0 z-[15] bg-black/25 transition-opacity duration-500" />}
-      {focusedPanel !== null && (
-        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[60] pointer-events-auto animate-in fade-in slide-in-from-top-2 duration-300">
-          <button onClick={() => setFocusedPanel(null)} className="flex items-center gap-2 px-4 py-2 bg-black/95 border border-[#FF2800]/25 text-[9px] font-black tracking-[0.3em] uppercase text-[#FF2800]/80 shadow-2xl">
-            <Minimize2 size={9} /> EXIT FOCUS MODE
-          </button>
-        </div>
-      )}
+      {/* ── CHAT ── */}
+      <main className={`relative flex flex-col h-full min-w-0 transition-[width] duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] ${splitView ? "w-full md:w-1/2" : "w-full"}`}
+        style={splitView ? { borderRight: `1px solid ${T.line}` } : undefined}>
 
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-
-      {isSidebarOpen && <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[45] md:hidden" onClick={() => setIsSidebarOpen(false)} />}
-
-      {/* ─── SIDEBAR ─────────────────────────────────────────────────────────── */}
-      <PanelShell id="sidebar" focusedPanel={focusedPanel} className={`fixed inset-y-0 left-0 z-50 w-[280px] md:w-[260px] h-full md:relative md:translate-x-0 transition-transform duration-300 ease-out ${isSidebarOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}`}>
-        <aside className="flex flex-col h-full bg-[#080808] border-r border-white/[0.05]">
-          {/* Logo */}
-          <div className="px-6 pt-6 pb-5 border-b border-white/[0.05]">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className="relative flex items-center justify-center w-8 h-8 border border-[#FF2800]/30">
-                  <Zap size={14} className="text-[#FF2800]" />
-                  <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-[#FF2800] rounded-full animate-pulse" />
-                </div>
-                <div>
-                  <div className="text-[13px] font-black text-white tracking-wider leading-none">INDRA</div>
-                  <div className="text-[8px] text-[#FF2800]/60 tracking-[0.2em] uppercase mt-0.5">Formula Bharat 2027</div>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <FocusButton panel="sidebar" focusedPanel={focusedPanel} onToggle={toggleFocus} />
-                <button onClick={() => setIsSidebarOpen(false)} className="md:hidden p-2 text-slate-500"><X size={18} /></button>
-              </div>
-            </div>
-
-            {/* Status badge */}
-            <div className="flex items-center gap-2 px-3 py-2 bg-[#FF2800]/5 border border-[#FF2800]/10">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#FF2800] animate-pulse shrink-0" />
-              <span className="text-[8px] font-bold text-[#FF2800]/70 uppercase tracking-[0.2em]">System Online</span>
-            </div>
+        {messages.length === 0 && (
+          <div aria-hidden className="absolute inset-0 overflow-hidden z-0">
+            {FLOATERS.map((f, i) => {
+              const m = motion(i);
+              const look =
+                f.kind === "key" ? { color: T.ink, fontWeight: 600, letterSpacing: "-0.03em" }
+                : f.kind === "code" ? { color: T.accent, fontWeight: 600, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", letterSpacing: "-0.04em" }
+                : f.kind === "q" ? { color: T.mute, fontWeight: 500 }
+                : { color: "#A1A1A6", fontWeight: 500 };
+              return (
+                <span
+                  key={i}
+                  className={`indra-float ${f.m ? "" : "hidden sm:block"}`}
+                  style={{
+                    left: `${f.x}%`, top: `${f.y}%`, fontSize: f.s,
+                    ["--r" as any]: `${f.r}deg`, ["--o" as any]: f.o, ["--d" as any]: `${m.delay}s`, ["--t" as any]: `${m.dur}s`,
+                    ["--dx" as any]: m.dx, ["--dy" as any]: m.dy, ["--dr" as any]: `${m.dr}deg`,
+                    ...look,
+                  }}>
+                  {f.t}
+                </span>
+              );
+            })}
           </div>
+        )}
 
-          <div className="p-4 space-y-1">
-            <button
-              onClick={() => { clearChat(); setIsSidebarOpen(false); }}
-              className="w-full flex items-center gap-2.5 px-4 py-3 bg-[#FF2800]/10 border border-[#FF2800]/20 text-[10px] font-bold text-[#FF2800] uppercase hover:bg-[#FF2800]/15 transition-colors group"
-            >
-              <Plus size={13} className="group-hover:rotate-90 transition-transform duration-200" /> New Query
+        <header className="shrink-0 h-14 flex items-center justify-between px-5 indra-glass sticky top-0 z-10" style={{ borderBottom: `1px solid ${T.line}` }}>
+          <h1 className="text-[17px] font-semibold tracking-[0.06em]">INDRA</h1>
+          {messages.length > 0 && (
+            <button onClick={newChat} className="indra-btn flex items-center gap-1.5 h-9 px-3 rounded-full text-[14px] font-medium transition-colors hover:bg-black/5" style={{ color: T.accent }}>
+              <Plus size={16} /> New chat
             </button>
-          </div>
-
-          <div className="px-4 mb-2 flex-1">
-            <p className="text-[8px] font-bold text-slate-700 uppercase tracking-[0.2em] px-3 mb-2">Navigation</p>
-            <button
-              onClick={() => { setAppMode("ask"); setIsSidebarOpen(false); }}
-              className={`w-full flex items-center gap-3 px-3 py-3 mb-1 text-left transition-colors rounded-sm ${appMode === 'ask' ? 'text-[#FF2800] bg-[#FF2800]/5' : 'text-slate-500 hover:text-slate-300'}`}
-            >
-              <MessageSquare size={13} />
-              <div className="text-[10px] font-bold uppercase">Regulation Query</div>
-              {appMode === 'ask' && <div className="ml-auto w-1 h-1 bg-[#FF2800] rounded-full" />}
-            </button>
-            <button
-              onClick={() => { setAppMode("quiz"); setIsSidebarOpen(false); }}
-              className={`w-full flex items-center gap-3 px-3 py-3 text-left transition-colors rounded-sm ${appMode === 'quiz' ? 'text-[#FF2800] bg-[#FF2800]/5' : 'text-slate-500 hover:text-slate-300'}`}
-            >
-              <BrainCircuit size={13} />
-              <div className="text-[10px] font-bold uppercase">Compliance Test</div>
-              {appMode === 'quiz' && <div className="ml-auto w-1 h-1 bg-[#FF2800] rounded-full" />}
-            </button>
-          </div>
-
-          {/* Bottom info strip */}
-          <div className="px-6 py-4 border-t border-white/[0.05]">
-            <p className="text-[8px] text-slate-700 uppercase tracking-widest mb-1">Build</p>
-            <p className="text-[9px] text-slate-600 font-mono">v2.0.0 · FB2027</p>
-          </div>
-        </aside>
-      </PanelShell>
-
-      {/* ─── MAIN FRAME ──────────────────────────────────────────────────────── */}
-      <main className="flex-1 flex flex-col h-full min-w-0 relative z-10">
-        <header className="shrink-0 h-12 flex items-center justify-between px-4 md:px-6 border-b border-white/[0.05] bg-black/60 backdrop-blur-md relative z-30">
-          <div className="flex items-center gap-3">
-            <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 text-slate-500 hover:text-white transition-colors"><Menu size={20} /></button>
-            <div className="flex items-center gap-2 text-[10px] md:text-[9px] font-bold tracking-[0.25em] uppercase">
-              <span className="text-slate-700">INDRA</span>
-              <ChevronRight size={10} className="text-slate-800" />
-              <span className="text-slate-400">{appMode === 'ask' ? 'QUERY ENGINE' : 'COMPLIANCE TEST'}</span>
-            </div>
-          </div>
-          <TelemetryStrip />
+          )}
         </header>
 
-        <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
-
-          {/* ── CHAT PANEL ── */}
-          <PanelShell id="chat" focusedPanel={focusedPanel} className={`flex flex-col transition-all duration-500 ease-out ${activeModelUrl ? 'flex-1 md:h-full md:w-1/2 border-b md:border-b-0 md:border-r border-white/[0.05]' : 'h-full w-full'}`}>
-
-            {appMode === 'ask' && (
-              <>
-                <div className="shrink-0 flex items-center justify-between px-4 md:px-6 pt-3 pb-1">
-                  <span className="text-[8px] font-bold tracking-[0.3em] text-slate-700 uppercase">Query Engine</span>
-                  <div className="flex items-center gap-2">
-                    {messages.length > 0 && (
-                      <button
-                        onClick={clearChat}
-                        title="Clear conversation"
-                        className="flex items-center gap-1 px-2 py-1 text-[8px] font-bold text-slate-600 hover:text-[#FF2800] border border-transparent hover:border-[#FF2800]/20 transition-all uppercase tracking-wider"
-                      >
-                        <Trash2 size={9} /> Clear
-                      </button>
-                    )}
-                    <FocusButton panel="chat" focusedPanel={focusedPanel} onToggle={toggleFocus} />
-                  </div>
-                </div>
-
-                <div className="flex-1 overflow-y-auto px-4 md:px-6 py-4 scroll-smooth">
-                  {messages.length === 0 && !isThinking ? (
-                    <div className="h-full flex flex-col items-center justify-center max-w-xl mx-auto text-center">
-                      {/* Hero mark */}
-                      <div className="relative mb-8">
-                        <div className="w-20 h-20 border border-[#FF2800]/20 flex items-center justify-center relative">
-                          <div className="absolute inset-0 border border-[#FF2800]/10 scale-110" />
-                          <div className="absolute inset-0 border border-[#FF2800]/5 scale-125" />
-                          <Zap size={28} className="text-[#FF2800]/80" />
-                          <div className="absolute inset-0 blur-2xl bg-[#FF2800]/10 rounded-full" />
-                        </div>
-                        {/* Corner accents */}
-                        <span className="absolute -top-px -left-px w-3 h-px bg-[#FF2800]/60" />
-                        <span className="absolute -top-px -left-px w-px h-3 bg-[#FF2800]/60" />
-                        <span className="absolute -bottom-px -right-px w-3 h-px bg-[#FF2800]/60" />
-                        <span className="absolute -bottom-px -right-px w-px h-3 bg-[#FF2800]/60" />
+        <div className="relative z-[1] flex-1 overflow-y-auto">
+          <div className="mx-auto w-full max-w-[720px] px-5 py-8 min-h-full flex flex-col">
+            {messages.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-center py-10 indra-rise">
+                <h2 className="text-[64px] md:text-[104px] leading-none font-semibold tracking-[-0.02em]">
+                  INDRA
+                </h2>
+                <p className="mt-5 text-[17px] md:text-[19px] leading-relaxed max-w-[420px]" style={{ color: T.mute }}>
+                  Every rulebook question, answered with the rule and the part.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-8">
+                {messages.map(msg => (
+                  <div key={msg.id} className={`indra-rise flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                    {msg.role === "user" && (
+                      <div className="max-w-[85%] px-4 py-2.5 rounded-[22px] text-[16px] leading-[1.45] whitespace-pre-wrap" style={{ background: T.fill }}>
+                        {msg.text}
                       </div>
+                    )}
 
-                      <h2 className="text-2xl md:text-3xl font-black tracking-tight text-white mb-1 uppercase">INDRA Online</h2>
-                      <p className="text-[#FF2800]/50 text-[9px] font-bold tracking-[0.3em] uppercase mb-3">Regulation Intelligence · Formula Bharat 2027</p>
-                      <p className="text-slate-600 text-xs mb-10 tracking-wide max-w-xs">Query any technical regulation, compliance rule, or structural requirement from the FB2027 rulebook.</p>
+                    {msg.role === "error" && (
+                      <div className="flex items-start gap-3 max-w-[85%] text-[15px] leading-relaxed">
+                        <AlertCircle size={18} className="mt-0.5 shrink-0" style={{ color: "#D70015" }} />
+                        <div>
+                          <p>{msg.text}</p>
+                          {msg.retryText && (
+                            <button onClick={() => sendMessage(msg.retryText!, true)} className="indra-btn mt-1 font-medium rounded" style={{ color: T.accent }}>
+                              Try again
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
-                        {QUICK_QUERIES.map((q, i) => (
+                    {msg.role === "bot" && (
+                      <div className="w-full text-[16px] leading-[1.6]">
+                        {renderTextWithCitations(msg)}
+
+                        {msg.model_url && (
                           <button
-                            key={i}
-                            onClick={() => { setInput(q.label); inputRef.current?.focus(); }}
-                            className="flex items-center gap-3 px-4 py-3 md:py-4 bg-[#0c0c0c] border border-white/[0.06] hover:border-[#FF2800]/30 hover:bg-[#FF2800]/5 text-left transition-all group"
-                          >
-                            <span className="text-[#FF2800]/50 shrink-0 group-hover:text-[#FF2800]/80 transition-colors">{q.icon}</span>
-                            <span className="text-[10px] font-bold tracking-wider uppercase text-slate-400 group-hover:text-slate-200 transition-colors">{q.label}</span>
-                            <ChevronRight size={9} className="ml-auto text-slate-700 group-hover:text-[#FF2800]/50 transition-colors" />
+                            onClick={() => handle3DModelLoad(msg.model_url!, msg.model_metadata, msg.highlight_meshes, msg.context_meshes)}
+                            className="indra-btn mt-4 w-full sm:w-auto flex items-center gap-3 pl-3 pr-5 py-2.5 rounded-2xl text-left transition-colors hover:bg-[#E8E8ED]"
+                            style={{ background: T.fill }}>
+                            <span className="w-9 h-9 rounded-xl flex items-center justify-center bg-white" style={{ color: T.accent }}>
+                              <Box size={18} />
+                            </span>
+                            <span>
+                              <span className="block text-[15px] font-medium leading-tight">{msg.model_metadata?.name ?? "3D model"}</span>
+                              <span className="block text-[13px]" style={{ color: T.mute }}>View in 3D</span>
+                            </span>
+                          </button>
+                        )}
+
+                        <div className="mt-3 -ml-2">
+                          <button onClick={() => copyText(msg.id, msg.text)} aria-label="Copy answer"
+                            className="indra-btn p-2 rounded-lg transition-colors hover:bg-black/5" style={{ color: T.mute }}>
+                            {copied === msg.id ? <Check size={16} /> : <Copy size={16} />}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {isThinking && (
+                  <div className="flex items-center gap-1.5 h-6" role="status" aria-label="Searching the rulebook">
+                    {[0, 1, 2].map(i => (
+                      <span key={i} className="indra-dot w-2 h-2 rounded-full" style={{ background: T.mute, animation: `indraDot 1.2s ${i * 0.15}s infinite` }} />
+                    ))}
+                    <span className="ml-2 text-[14px]" style={{ color: T.mute }}>Searching the rulebook</span>
+                  </div>
+                )}
+                <div ref={bottomRef} />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Composer */}
+        <div className="relative z-[1] shrink-0 px-5 pb-5 pt-2" style={{ paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}>
+          <div className="mx-auto max-w-[720px]">
+            <div className="flex items-end gap-2 pl-5 pr-2 py-2 rounded-[26px] bg-[#F2F2F7] transition-shadow focus-within:shadow-[0_0_0_3px_rgba(10,100,216,0.18)]"
+              style={{ border: `1px solid ${T.line}` }}>
+              <textarea
+                ref={textareaRef}
+                rows={1}
+                value={input}
+                onChange={e => setInput(e.target.value.slice(0, MAX_MESSAGE_LENGTH))}
+                onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); sendMessage(input); } }}
+                placeholder="Ask about a rule"
+                aria-label="Message"
+                className="flex-1 resize-none bg-transparent py-2 text-[16px] leading-6 focus:outline-none placeholder:text-[#6E6E73]"
+              />
+              <button
+                onClick={() => sendMessage(input)}
+                disabled={isThinking || !input.trim()}
+                aria-label="Send"
+                className="indra-btn shrink-0 w-9 h-9 rounded-full flex items-center justify-center text-white transition-all disabled:cursor-not-allowed"
+                style={{ background: input.trim() && !isThinking ? T.accent : "#D1D1D6" }}>
+                {isThinking ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={18} strokeWidth={2.5} />}
+              </button>
+            </div>
+            {input.length > MAX_MESSAGE_LENGTH * 0.8 && (
+              <p className="mt-1.5 text-right text-[12px]" style={{ color: T.mute }}>{input.length} / {MAX_MESSAGE_LENGTH}</p>
+            )}
+          </div>
+        </div>
+      </main>
+
+      {/* ── 3D VIEWER ──
+          Desktop: right half. Mobile: full-screen sheet (previously hidden, so the button did nothing). */}
+      {hasViewer && (
+        <section
+          aria-label="3D viewer"
+          className={`${is3DFullscreen ? "fixed inset-0 z-50" : "fixed inset-0 z-40 md:static md:z-auto md:w-1/2"} flex flex-col relative overflow-hidden indra-pop`}
+          style={{ background: "linear-gradient(180deg,#F5F5F7 0%,#E9E9EE 100%)" }}>
+
+          <div className="absolute top-0 inset-x-0 z-10 flex items-center justify-between p-4" style={{ paddingTop: "max(1rem, env(safe-area-inset-top))" }}>
+            <button onClick={() => setActiveModelUrl(null)} aria-label="Close 3D viewer"
+              className="indra-btn indra-glass w-10 h-10 rounded-full flex items-center justify-center shadow-sm transition-colors hover:bg-white">
+              <X size={18} />
+            </button>
+            <button onClick={() => setIs3DFullscreen(f => !f)} aria-label={is3DFullscreen ? "Exit full screen" : "Full screen"}
+              className="indra-btn indra-glass hidden md:flex w-10 h-10 rounded-full items-center justify-center shadow-sm transition-colors hover:bg-white">
+              {is3DFullscreen ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+            </button>
+          </div>
+
+          <div className="flex-1 w-full h-full">
+            <model-viewer
+              ref={modelViewerRef}
+              src={activeModelUrl}
+              alt={activeModelMetadata?.name ?? "3D model"}
+              auto-rotate="true"
+              auto-rotate-delay="3000"
+              camera-controls="true"
+              touch-action="pan-y"
+              shadow-intensity="1"
+              style={{ width: "100%", height: "100%", backgroundColor: "transparent", outline: "none" }}
+            />
+          </div>
+
+          {isModelLoading && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none" role="status">
+              <div className="indra-glass flex items-center gap-2 px-4 py-2 rounded-full text-[14px] shadow-sm">
+                <Loader2 size={16} className="animate-spin" /> Loading model
+              </div>
+            </div>
+          )}
+
+          {activeModelMetadata && !isModelLoading && (
+            <div className="absolute inset-x-0 bottom-0 z-10 p-4" style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}>
+              <div className="indra-glass mx-auto max-w-[560px] rounded-[26px] shadow-[0_8px_32px_rgba(0,0,0,0.10)]" style={{ border: "1px solid rgba(255,255,255,.7)" }}>
+                <button onClick={() => setShowPanel(s => !s)} aria-expanded={showPanel}
+                  className="indra-btn w-full flex items-center justify-between px-5 py-3.5 rounded-[26px] text-left">
+                  <span className="text-[16px] font-semibold tracking-tight truncate">{activeModelMetadata.name}</span>
+                  <ChevronDown size={18} className={`shrink-0 transition-transform ${showPanel ? "" : "-rotate-180"}`} style={{ color: T.mute }} />
+                </button>
+
+                {showPanel && (
+                  <div className="px-5 pb-4">
+                    {highlightMeshes.length > 0 && (
+                      <div className="flex flex-wrap gap-2 max-h-28 overflow-y-auto">
+                        <button onClick={() => setIsolatedParts([])} aria-pressed={isolatedParts.length === 0}
+                          className="indra-btn px-3.5 h-8 rounded-full text-[13px] font-medium transition-colors"
+                          style={isolatedParts.length === 0 ? { background: T.ink, color: "#fff" } : { background: "rgba(0,0,0,.06)" }}>
+                          All parts
+                        </button>
+                        {highlightMeshes.map(part => {
+                          const on = isolatedParts.includes(part);
+                          return (
+                            <button key={part} aria-pressed={on}
+                              onClick={() => setIsolatedParts(p => p.includes(part) ? p.filter(x => x !== part) : [...p, part])}
+                              className="indra-btn px-3.5 h-8 rounded-full text-[13px] font-medium transition-colors"
+                              style={on ? { background: T.accent, color: "#fff" } : { background: "rgba(0,0,0,.06)" }}>
+                              {partLabel(part)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="mt-4 flex items-center justify-between gap-3">
+                      {/* Segmented control: how to treat everything that isn't selected */}
+                      <div role="group" aria-label="Surrounding parts" className="flex p-0.5 rounded-full" style={{ background: "rgba(0,0,0,.06)" }}>
+                        {(["ghost", "hidden"] as IsolationMode[]).map(m => (
+                          <button key={m} onClick={() => setIsolationMode(m)} aria-pressed={isolationMode === m}
+                            className="indra-btn px-3 h-7 rounded-full text-[13px] font-medium transition-all"
+                            style={isolationMode === m ? { background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,.12)" } : { color: T.mute }}>
+                            {m === "ghost" ? "Faded" : "Hidden"}
                           </button>
                         ))}
                       </div>
-
-                      {/* Divider with label */}
-                      <div className="flex items-center gap-3 w-full mt-8 mb-0">
-                        <div className="flex-1 h-px bg-white/[0.04]" />
-                        <span className="text-[8px] text-slate-700 uppercase tracking-[0.3em]">or type below</span>
-                        <div className="flex-1 h-px bg-white/[0.04]" />
+                      <div className="flex gap-1" style={{ color: T.mute }}>
+                        <button aria-label="Zoom out" onClick={() => modelViewerRef.current?.zoom(-1)} className="indra-btn p-2 rounded-full transition-colors hover:bg-black/5"><ZoomOut size={17} /></button>
+                        <button aria-label="Zoom in" onClick={() => modelViewerRef.current?.zoom(1)} className="indra-btn p-2 rounded-full transition-colors hover:bg-black/5"><ZoomIn size={17} /></button>
+                        <button aria-label="Reset view" onClick={() => modelViewerRef.current?.resetTurntableRotation()} className="indra-btn p-2 rounded-full transition-colors hover:bg-black/5"><RotateCw size={17} /></button>
                       </div>
                     </div>
-                  ) : (
-                    <div className="max-w-3xl mx-auto space-y-6 pb-6">
-                      {messages.map(msg => (
-                        <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-                          <span className={`text-[8px] tracking-[0.3em] uppercase mb-1.5 font-bold ${msg.role === 'user' ? 'text-slate-600' : msg.role === 'error' ? 'text-red-500/60' : 'text-[#FF2800]/60'}`}>
-                            {msg.role === 'user' ? 'YOU' : msg.role === 'error' ? 'ERROR' : 'INDRA'}
-                          </span>
-                          <div className={`relative p-4 md:p-5 text-sm leading-relaxed w-full transition-all
-                            ${msg.role === 'user' ? 'bg-white/[0.06] border border-white/[0.08]' :
-                              msg.role === 'error' ? 'bg-red-950/30 border border-red-800/30 border-l-2 border-l-red-500/60' :
-                              'bg-[#0c0c0c] border border-white/[0.07] border-l-2 border-l-[#FF2800]/60'}`}>
-
-                            {msg.role === 'error' && (
-                              <div className="flex items-center gap-2 mb-2 text-red-400">
-                                <AlertCircle size={13} />
-                                <span className="text-[9px] font-black uppercase tracking-widest">System Error</span>
-                              </div>
-                            )}
-
-                            <p className="whitespace-pre-wrap">
-                              {msg.role === 'bot'
-                                ? renderTextWithCitations(msg.text, msg.citations)
-                                : msg.text
-                              }
-                            </p>
-
-                            {msg.role === 'bot' && msg.citations && msg.citations.length > 0 && (
-                              <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
-                                {msg.citations.map((c, i) => (
-                                  <div key={c.rule_id} className="flex items-start gap-2 text-[10px] text-slate-500">
-                                    <span className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded-sm bg-[#FF2800]/20 text-[#FF2800] font-black text-[8px]">{i + 1}</span>
-                                    <span><span className="text-[#FF2800]/70 font-bold">{c.rule_id}</span> — {c.content}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-
-                            {msg.role === 'bot' && (
-                              <button
-                                onClick={() => copyToClipboard(msg.text, msg.id)}
-                                title="Copy response"
-                                className="absolute top-3 right-3 p-1.5 text-slate-700 hover:text-slate-400 transition-colors"
-                              >
-                                {copied === msg.id
-                                  ? <CheckCircle2 size={13} className="text-green-500" />
-                                  : <Copy size={13} />
-                                }
-                              </button>
-                            )}
-
-                            <div className="mt-2 text-[8px] text-slate-700 font-mono">
-                              {new Date(msg.timestamp).toLocaleTimeString()}
-                            </div>
-
-                            {msg.model_url && msg.role === 'bot' && (
-                              <div className="mt-4 pt-4 border-t border-white/[0.07]">
-                                <button
-                                  onClick={() => handle3DModelLoad(
-                                    msg.model_url!,
-                                    msg.model_metadata,
-                                    msg.cad_nodes,
-                                    msg.highlight_meshes ?? [],
-                                    msg.context_meshes ?? [],
-                                  )}
-                                  className="flex items-center gap-2 px-4 py-3 md:py-2.5 text-[10px] font-black bg-[#FF2800]/10 border border-[#FF2800]/30 text-[#FF2800] uppercase w-full md:w-auto justify-center hover:bg-[#FF2800]/15 transition-colors group"
-                                >
-                                  <Box size={14} className="group-hover:rotate-12 transition-transform" /> Load 3D Model
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                      {isThinking && (
-                        <div className="flex items-center gap-3 text-[9px] text-[#FF2800]/60 uppercase">
-                          <Loader2 size={12} className="animate-spin" />
-                          <span>Scanning regulations...</span>
-                          <span className="flex gap-0.5">
-                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                            <span className="w-1 h-1 bg-[#FF2800]/40 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                          </span>
-                        </div>
-                      )}
-                      <div ref={bottomRef} />
-                    </div>
-                  )}
-                </div>
-
-                <div className="shrink-0 px-4 md:px-6 py-4 pb-[env(safe-area-inset-bottom)] bg-[#060606] border-t border-white/[0.04]">
-                  <div className="max-w-3xl mx-auto">
-                    {input.length > 800 && (
-                      <div className="flex justify-end mb-1">
-                        <span className={`text-[9px] font-mono ${input.length > 950 ? 'text-[#FF2800]' : 'text-slate-600'}`}>
-                          {input.length}/{MAX_MESSAGE_LENGTH}
-                        </span>
-                      </div>
-                    )}
-                    <div className="relative flex flex-row items-center gap-2">
-                      <input
-                        ref={inputRef}
-                        value={input}
-                        onChange={e => setInput(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
-                        placeholder="Query regulations..."
-                        disabled={isThinking}
-                        maxLength={MAX_MESSAGE_LENGTH}
-                        className="flex-1 bg-[#0c0c0c] border border-white/[0.07] focus:border-[#FF2800]/30 px-4 py-4 text-sm text-white placeholder:text-slate-600 focus:outline-none transition-colors"
-                      />
-                      <button
-                        onClick={() => sendMessage(input)}
-                        disabled={isThinking || !input.trim()}
-                        className={`shrink-0 px-6 py-4 flex items-center justify-center gap-2 text-[10px] font-black uppercase transition-all ${input.trim() && !isThinking ? 'bg-[#FF2800] text-white hover:bg-[#FF4000]' : 'bg-white/5 text-slate-600 cursor-not-allowed'}`}
-                      >
-                        {isThinking ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                      </button>
-                    </div>
-                    <p className="text-[8px] text-slate-700 mt-1.5 text-center tracking-wider">Press Enter to send · Esc to exit focus</p>
                   </div>
-                </div>
-              </>
-            )}
-
-            {/* ─── QUIZ MODE ───────────────────────────────────────────────── */}
-            {appMode === 'quiz' && (
-              <div className="flex-1 flex flex-col p-6 overflow-y-auto">
-                <div className="flex-1 max-w-2xl mx-auto w-full">
-                  {!quizFinished ? (
-                    <>
-                      <div className="flex items-center gap-3 mb-6">
-                        <div className="flex-1 h-px bg-white/[0.07]">
-                          <div
-                            className="h-full bg-[#FF2800] transition-all duration-500"
-                            style={{ width: `${((qIndex) / QUIZ_QUESTIONS.length) * 100}%` }}
-                          />
-                        </div>
-                        <span className="text-[#FF2800] text-xs font-black uppercase tracking-widest whitespace-nowrap">
-                          {qIndex + 1} / {QUIZ_QUESTIONS.length}
-                        </span>
-                      </div>
-
-                      <h2 className="text-xl font-bold text-white mb-8 leading-snug">{QUIZ_QUESTIONS[qIndex].question}</h2>
-
-                      <div className="space-y-3">
-                        {QUIZ_QUESTIONS[qIndex].options.map((opt, i) => {
-                          const isCorrect = i === QUIZ_QUESTIONS[qIndex].correctAnswer;
-                          const isSelected = selectedAns === i;
-                          let optClass = 'border-white/10 hover:border-white/30 text-slate-300 cursor-pointer';
-                          if (isAnsChecked) {
-                            if (isCorrect) optClass = 'border-green-500 bg-green-500/10 text-green-400 cursor-default';
-                            else if (isSelected && !isCorrect) optClass = 'border-red-500 bg-red-500/10 text-red-400 cursor-default';
-                            else optClass = 'border-white/5 text-slate-600 cursor-default';
-                          } else if (isSelected) {
-                            optClass = 'border-[#FF2800] bg-[#FF2800]/10 text-white cursor-pointer';
-                          }
-                          return (
-                            <button
-                              key={i}
-                              onClick={() => { if (!isAnsChecked) setSelectedAns(i); }}
-                              disabled={isAnsChecked}
-                              className={`w-full text-left p-4 border transition-all flex items-center gap-3 ${optClass}`}
-                            >
-                              {isAnsChecked && isCorrect && <CheckCircle2 size={15} className="shrink-0 text-green-500" />}
-                              {isAnsChecked && isSelected && !isCorrect && <XCircle size={15} className="shrink-0 text-red-500" />}
-                              {!(isAnsChecked && (isCorrect || (isSelected && !isCorrect))) && (
-                                <span className="shrink-0 w-4 h-4 flex items-center justify-center border border-current rounded-sm text-[9px] font-black">
-                                  {String.fromCharCode(65 + i)}
-                                </span>
-                              )}
-                              <span>{opt}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-
-                      {isAnsChecked && (
-                        <div className="mt-5 p-4 bg-[#0c0c0c] border border-white/[0.08] border-l-2 border-l-[#FF2800]/60 text-sm text-slate-300 leading-relaxed">
-                          <span className="text-[9px] font-black uppercase tracking-widest text-[#FF2800]/70 block mb-1">Explanation</span>
-                          {QUIZ_QUESTIONS[qIndex].explanation}
-                        </div>
-                      )}
-
-                      <button
-                        onClick={() => {
-                          if (selectedAns === null) return;
-                          if (!isAnsChecked) {
-                            setIsAnsChecked(true);
-                            if (!scoreCounted && selectedAns === QUIZ_QUESTIONS[qIndex].correctAnswer) {
-                              setQuizScore(s => s + 1);
-                              setScoreCounted(true);
-                            }
-                          } else {
-                            if (qIndex + 1 < QUIZ_QUESTIONS.length) {
-                              setQIndex(i => i + 1);
-                              setSelectedAns(null);
-                              setIsAnsChecked(false);
-                              setScoreCounted(false);
-                            } else {
-                              setQuizFinished(true);
-                            }
-                          }
-                        }}
-                        disabled={selectedAns === null}
-                        className="mt-6 w-full py-4 bg-[#FF2800] text-white font-black text-sm disabled:opacity-30 uppercase tracking-widest transition-colors hover:bg-[#FF4000] relative overflow-hidden group"
-                      >
-                        <span className="absolute inset-0 bg-white/10 translate-x-[-110%] group-hover:translate-x-[110%] transition-transform duration-500 skew-x-12" />
-                        {!isAnsChecked ? 'CHECK ANSWER' : qIndex + 1 < QUIZ_QUESTIONS.length ? 'NEXT QUESTION →' : 'SEE RESULTS'}
-                      </button>
-                    </>
-                  ) : (
-                    <div className="text-center py-12">
-                      {/* Score display */}
-                      <div className="relative inline-block mb-4">
-                        <div className="text-7xl font-black text-[#FF2800] tabular-nums">{quizScore}<span className="text-3xl text-slate-600">/{QUIZ_QUESTIONS.length}</span></div>
-                      </div>
-                      <h2 className="text-3xl font-black text-white mb-2 uppercase">Quiz Complete</h2>
-                      <p className="text-slate-500 text-sm mb-8">
-                        {quizScore === QUIZ_QUESTIONS.length ? '✓ Perfect score — full compliance.' : quizScore >= QUIZ_QUESTIONS.length / 2 ? 'Good result. Review flagged rules.' : 'Needs work. Study the rulebook carefully.'}
-                      </p>
-                      <div className="flex gap-3 justify-center">
-                        <button
-                          onClick={() => { setQIndex(0); setQuizFinished(false); setQuizScore(0); setSelectedAns(null); setIsAnsChecked(false); setScoreCounted(false); }}
-                          className="px-8 py-3 bg-[#FF2800] hover:bg-[#FF4000] text-white font-bold uppercase tracking-widest transition-colors"
-                        >
-                          Restart
-                        </button>
-                        <button
-                          onClick={() => setAppMode('ask')}
-                          className="px-8 py-3 bg-white/10 hover:bg-white/20 text-white font-bold uppercase tracking-widest transition-colors"
-                        >
-                          Back to Query
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
+                )}
               </div>
-            )}
-          </PanelShell>
-
-          {/* ─── 3D VIEWER PANEL ─────────────────────────────────────────────── */}
-          {activeModelUrl && (
-            <PanelShell id="3d" focusedPanel={focusedPanel} className={`${is3DFullscreen ? 'fixed inset-0 z-[60]' : 'flex h-[45vh] md:h-full w-full md:w-1/2'} flex-col bg-[#070707] relative`}>
-
-              <div className="absolute top-3 left-3 right-3 z-30 flex items-center justify-between pointer-events-none">
-                <div className="bg-black/80 backdrop-blur px-3 py-1.5 flex items-center gap-2 pointer-events-auto border border-[#FF2800]/20 rounded-lg">
-                  <span className="w-1.5 h-1.5 bg-[#FF2800] animate-pulse rounded-full" />
-                  <span className="text-[9px] font-black text-[#FF2800] uppercase tracking-wider">Live Render</span>
-                  {highlightMeshes.length > 0 && (
-                    <span className="text-[8px] text-slate-500 ml-1">
-                      {highlightMeshes.length} parts · {contextMeshes.length} ctx
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2 pointer-events-auto">
-                  <button
-                    onClick={() => setShowDebug(!showDebug)}
-                    className={`px-2 py-1.5 text-[9px] font-black uppercase rounded transition-colors ${showDebug ? 'bg-[#FF2800] text-white' : 'bg-black/80 text-slate-400 hover:text-white'}`}
-                  >
-                    Debug
-                  </button>
-                  <button
-                    onClick={() => setShowModelInfo(v => !v)}
-                    title={showModelInfo ? 'Hide info panel' : 'Show info panel'}
-                    className="p-2.5 bg-black/80 hover:bg-black text-slate-400 hover:text-white rounded-lg transition-colors"
-                  >
-                    {showModelInfo ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                  <FocusButton panel="3d" focusedPanel={focusedPanel} onToggle={toggleFocus} />
-                  <button onClick={() => setIs3DFullscreen(!is3DFullscreen)} className="p-2.5 bg-black/80 hover:bg-black text-white rounded-lg transition-colors">
-                    <Maximize2 size={14} />
-                  </button>
-                  <button onClick={close3DModel} className="p-2.5 bg-[#FF2800] hover:bg-[#FF2800]/80 text-white rounded-lg transition-colors">
-                    <X size={14} />
-                  </button>
-                </div>
-              </div>
-
-              {showDebug && (
-                <div className="absolute top-14 right-3 z-40 bg-black/95 border border-[#FF2800]/40 p-4 max-w-xs text-[9px] font-mono text-slate-300 rounded-lg shadow-2xl overflow-y-auto max-h-[40%] pointer-events-auto">
-                  <h4 className="text-[#FF2800] mb-2 font-black uppercase tracking-widest border-b border-[#FF2800]/30 pb-1">CAD Inspector</h4>
-                  <div className="mb-1"><strong className="text-white">Isolated:</strong> <span className="text-[#FF2800] ml-1">{isolatedParts.length > 0 ? isolatedParts.join(', ') : 'None (all highlights)'}</span></div>
-                  <div className="mb-1"><strong className="text-white">Highlights:</strong> <span className="text-orange-400 ml-1">{highlightMeshes.join(', ') || 'None'}</span></div>
-                  <div className="mb-2"><strong className="text-white">Context:</strong> <span className="text-slate-400 ml-1">{contextMeshes.join(', ') || 'None'}</span></div>
-                  <div className="mb-1"><strong className="text-white">Progress:</strong> <span className="text-green-400 ml-1">{modelLoadProgress}%</span></div>
-                  <div><strong className="text-white">GLB Materials ({modelParts.length}):</strong></div>
-                  <ul className="mt-1 space-y-1 max-h-32 overflow-y-auto">
-                    {modelParts.map((mat, i) => (
-                      <li key={i} className={`pl-2 border-l ${matchesMeshName(mat, highlightMeshes) ? 'border-orange-500 text-orange-400' : matchesMeshName(mat, contextMeshes) ? 'border-slate-500 text-slate-400' : 'border-slate-700 text-slate-600'}`}>
-                        {mat}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <div className="flex-1 w-full h-full cursor-move">
-                <model-viewer
-                  ref={modelViewerRef}
-                  src={activeModelUrl}
-                  auto-rotate={autoRotateEnabled ? "true" : "false"}
-                  camera-controls="true"
-                  style={{ width: '100%', height: '100%', backgroundColor: '#080808' }}
-                />
-              </div>
-
-              {isModelLoading && (
-                <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none">
-                  <div className="h-[2px] bg-white/5">
-                    <div
-                      className="h-full bg-[#FF2800] transition-all duration-150 shadow-[0_0_8px_rgba(255,40,0,0.6)]"
-                      style={{ width: `${modelLoadProgress}%` }}
-                    />
-                  </div>
-                  <div className="px-3 py-1 bg-black/80 text-[8px] font-black uppercase tracking-widest text-[#FF2800]/70 text-right">
-                    LOADING {modelLoadProgress}%
-                  </div>
-                </div>
-              )}
-
-              {showModelInfo && activeModelMetadata && !isModelLoading && (
-                <div className="absolute bottom-3 left-3 right-3 z-30 bg-black/95 backdrop-blur-md border border-white/[0.08] p-4 rounded-xl shadow-2xl max-h-[55%] overflow-y-auto">
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <h3 className="text-base font-black text-white">{activeModelMetadata.name}</h3>
-                      {highlightMeshes.length > 0 && (
-                        <p className="text-[9px] text-[#FF2800]/70 mt-0.5 uppercase tracking-wider">
-                          {highlightMeshes.length} part{highlightMeshes.length > 1 ? 's' : ''} highlighted
-                        </p>
-                      )}
-                    </div>
-                    <button onClick={clearIsolation} className="flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-white transition-colors">
-                      <RefreshCw size={13} /> Reset
-                    </button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 mb-4">
-                    <button
-                      onClick={() => setIsolationMode(m => m === 'ghost' ? 'hidden' : 'ghost')}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${isolationMode === 'hidden' ? 'bg-red-500/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400 hover:border-white/40'}`}
-                    >
-                      {isolationMode === 'hidden' ? <><EyeOff size={10} /> HIDDEN</> : <><Eye size={10} /> GHOSTED</>}
-                    </button>
-                    <button
-                      onClick={() => setHighlightSelected(h => !h)}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-black rounded-md border tracking-widest uppercase transition-all ${highlightSelected ? 'bg-[#FF2800]/10 border-[#FF2800] text-[#FF2800]' : 'border-white/20 text-slate-400 hover:border-white/40'}`}
-                    >
-                      {highlightSelected ? 'HIGHLIGHT ON' : 'HIGHLIGHT OFF'}
-                    </button>
-                  </div>
-
-                  {highlightMeshes.length > 0 && (
-                    <div className="mb-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Layers size={13} className="text-[#FF2800]" />
-                        <span className="text-[9px] font-black uppercase tracking-widest text-white">Relevant Parts</span>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          onClick={clearIsolation}
-                          className={`px-3 py-2 text-[9px] font-black uppercase tracking-wider rounded-lg transition-all border ${isolatedParts.length === 0 ? 'bg-[#FF2800] text-white border-[#FF2800] shadow-[0_0_12px_rgba(255,40,0,0.35)]' : 'bg-white/5 border-transparent hover:border-white/20 text-slate-400'}`}
-                        >
-                          All Parts
-                        </button>
-                        {highlightMeshes.map(partName => {
-                          const isActive = isolatedParts.includes(partName);
-                          return (
-                            <button
-                              key={partName}
-                              onClick={() => togglePartIsolation(partName)}
-                              className={`px-3 py-2 text-[9px] font-black uppercase tracking-wider rounded-lg transition-all border ${isActive
-                                ? 'bg-[#FF2800]/20 border-[#FF2800] text-[#FF2800] shadow-[0_0_10px_rgba(255,40,0,0.2)]'
-                                : 'bg-white/5 border-transparent hover:border-[#FF2800]/30 hover:text-[#FF2800]/70 text-slate-300'}`}
-                            >
-                              {cleanPartName(partName)}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {contextMeshes.length > 0 && (
-                    <div className="mb-4 pt-3 border-t border-white/[0.06]">
-                      <div className="flex items-center gap-2 mb-1.5">
-                        <div className="w-3 h-3 rounded-sm bg-slate-500/30 border border-slate-500/50" />
-                        <span className="text-[8px] font-bold uppercase tracking-widest text-slate-600">
-                          Context structure ({contextMeshes.length} parts — translucent)
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-between pt-3 border-t border-white/[0.06]">
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setAutoRotateEnabled(!autoRotateEnabled)}
-                        title={autoRotateEnabled ? 'Pause rotation' : 'Start rotation'}
-                        className={`p-2.5 rounded-lg transition-colors ${autoRotateEnabled ? 'bg-[#FF2800]/20 text-[#FF2800]' : 'bg-white/5 text-slate-400 hover:text-white'}`}
-                      >
-                        <Play size={15} />
-                      </button>
-                      <button onClick={reset3DCamera} title="Reset camera" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors">
-                        <RotateCw size={15} />
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button onClick={zoomOut} title="Zoom out" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomOut size={15} /></button>
-                      <button onClick={zoomIn} title="Zoom in" className="p-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white transition-colors"><ZoomIn size={15} /></button>
-                    </div>
-                    <button
-                      onClick={downloadModel}
-                      className="flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 rounded-lg text-[9px] font-black tracking-widest text-slate-300 hover:text-white transition-colors"
-                    >
-                      <Download size={13} /> DOWNLOAD
-                    </button>
-                  </div>
-                </div>
-              )}
-            </PanelShell>
+            </div>
           )}
-        </div>
-      </main>
+        </section>
+      )}
     </div>
   );
 }
