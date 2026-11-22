@@ -261,14 +261,15 @@ async function saveLog(entry: Record<string, unknown>) {
     const { error } = await supabase.from('query_logs').insert(entry);
     if (error) {
       logger.error('saveLog DB error', {
-        message: error.message,
-        details: error.details,
+        message: typeof error.message === 'object' ? JSON.stringify(error.message) : error.message,
+        details: typeof error.details === 'object' ? JSON.stringify(error.details) : error.details,
         code: error.code,
+        raw: JSON.stringify(error) // Captures everything just in case
       });
     }
-  } catch (err) {
+  } catch (err: any) {
     logger.error('saveLog DB exception', {
-      message: err instanceof Error ? err.message : JSON.stringify(err),
+      message: err?.message || JSON.stringify(err),
     });
   }
 }
@@ -345,6 +346,8 @@ async function callOpenRouter(
         model: models[0],
         models, // OpenRouter handles fallback automatically in one hop
         temperature,
+        max_tokens: 900,
+        reasoning: { effort: 'medium' }, // <--- ADD THIS
         provider: { sort: 'latency' }, // Picks the fastest host
         ...(requireJson ? { response_format: { type: 'json_object' } } : {}),
         messages: [{ role: 'user', content: prompt }],
@@ -980,15 +983,14 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     }
 
     // 4. Build enriched pre-prompt context with graph relationship explanations
-    const filteredRulesText =
-      rerankedRules.length > 4
-        ? await compressRelevantEvidence(trimmed, rerankedRules)
-        : rerankedRules
-            .map(
-              r =>
-                `[Rule ${r.rule_id}${r.section ? ` | Section: ${r.section}` : ''}]\n${r.content}`
-            )
-            .join('\n\n');
+// 4. Build enriched pre-prompt context directly from top 8 Cohere rules
+    const topRules = rerankedRules.slice(0, 8);
+    const filteredRulesText = topRules
+      .map(
+        r =>
+          `[Rule ${r.rule_id}${r.section ? ` | Section: ${r.section}` : ''}]\n${r.content}`
+      )
+      .join('\n\n');
 
     const ruleContext = [
       filteredRulesText,
