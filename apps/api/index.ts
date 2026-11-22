@@ -305,10 +305,11 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // Primary synthesis chain (falls back server-side if any model spikes or 503s)
+// Primary synthesis chain (falls back server-side if any model spikes or 503s)
 const OPENROUTER_SYNTHESIS_MODELS = [
-  'anthropic/claude-haiku-4.5',
+  'z-ai/glm-5.3-flash',
+  'deepseek/deepseek-v4.1-flash-1017',
   'google/gemini-2.5-flash',
-  'openai/gpt-4o-mini',
 ];
 
 // Ultra-fast compression model
