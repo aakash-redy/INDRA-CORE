@@ -8,6 +8,10 @@ import dotenv from 'dotenv';
 import helmet from 'helmet';
 import Groq from 'groq-sdk';
 import crypto from 'crypto';
+const RULE_ID_RE = /\b([A-Z]{1,3}\.?\d+(?:\.\d+){1,3})\b/;
+const URL_RE     = /\bhttps?:\/\/\S+/i;
+const CODE_RE    = /```|<code>|function\s*\(|class\s+\w+\s*[{:]/i;
+const ESC_RE     = /\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}/;
 
 dotenv.config();
 
@@ -849,14 +853,58 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       return;
     }
 
-    // 1. Multi-rule hybrid vector + graph RPC
-    const { data: rawGraphRules, error: rpcError } = await supabase.rpc('match_multi_rules_with_graph', {
-      query_embedding:     expandedEmbedding,
-      explicit_rule_ids:   explicitRuleIds,
-      primary_match_count: CONFIG.MATCH_COUNT,
-      related_match_limit: CONFIG.GRAPH_RELATED_LIMIT,
-    });
+    // 1. Multi-rule hybrid vector + graph RPC & CAD component search in parallel
+    const [graphRulesRes, cadRes] = await Promise.all([
+      supabase.rpc('match_multi_rules_with_graph', {
+        query_embedding:     expandedEmbedding,
+        explicit_rule_ids:   explicitRuleIds,
+        primary_match_count: CONFIG.MATCH_COUNT,
+        related_match_limit: CONFIG.GRAPH_RELATED_LIMIT,
+      }),
+      supabase.rpc('match_cad_components', {
+        query_embedding: expandedEmbedding,
+        match_threshold: 0.65, // Nomic baseline similarity threshold
+        match_count: 3
+      })
+    ]);
+
+    const { data: rawGraphRules, error: rpcError } = graphRulesRes;
     if (rpcError) logger.error('match_multi_rules_with_graph RPC error', rpcError, { requestId });
+    if (cadRes.error) logger.error('match_cad_components RPC error', cadRes.error, { requestId });
+
+    // 2. Process CAD Payload
+    let modelPayload: Record<string, any> = {
+      model_url: null,
+      model_metadata: null,
+      highlight_meshes: [],
+      context_meshes: [],
+      cad_nodes: []
+    };
+
+    if (cadRes.data && cadRes.data.length > 0) {
+      const top = cadRes.data[0];
+      // Merge highlights if multiple matched components belong to the same 3D assembly
+      const sameModel = cadRes.data.filter((r: any) => r.model_id === top.model_id);
+      
+      const highlightMeshes = [...new Set(sameModel.flatMap((r: any) => r.highlight_meshes || []))];
+      const contextMeshes = [...new Set(sameModel.flatMap((r: any) => r.context_meshes || []))]
+        .filter(mesh => !highlightMeshes.includes(mesh));
+
+      modelPayload = {
+        model_url: top.model_url,
+        model_metadata: {
+          name: top.model_name,
+          category: top.model_category,
+          tags: sameModel.map((r: any) => r.component_name)
+        },
+        highlight_meshes: highlightMeshes,
+        context_meshes: contextMeshes,
+        cad_nodes: []
+      };
+      logger.info('[CAD] 3D layer connected', { requestId, model: top.model_name, highlights: highlightMeshes.length });
+    } else {
+      logger.info('[CAD] No 3D components matched the query threshold', { requestId });
+    }
 
     const mappedRules: RuleChunk[] = ((rawGraphRules ?? []) as RawGraphRuleRow[]).map(r => ({
       rule_id:            r.rule_id,
@@ -884,7 +932,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       Promise.resolve(null),
     ]);
 
-    // 2. Keep explicitly mentioned rules locked at top; rerank semantic + graph-linked rules
+    // 3. Keep explicitly mentioned rules locked at top; rerank semantic + graph-linked rules
     const explicitLocked     = mappedRules.filter(r => r.match_role === 'explicit_primary');
     const candidatesToRerank = mappedRules.filter(r => r.match_role !== 'explicit_primary');
 
@@ -896,11 +944,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
     const hasRuleMatches    = rerankedRules.length > 0;
     const hasLearnedMatches = learnedMatches.length > 0;
-    const highlightMeshes: string[] = [];
-    const contextMeshes: string[]   = [];
-    const cadNodes: CadNodeMatch[]  = [];
-
-    logger.info('[CAD] 3D layer partially disconnected — meshes suppressed (dev mode)', { requestId });
 
     if (!hasRuleMatches && !hasLearnedMatches) {
       logger.info('No rulebook match found', { requestId, domain: sanitizedDomain });
@@ -917,7 +960,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       return;
     }
 
-    // 3. Build enriched pre-prompt context with graph relationship explanations
+    // 4. Build enriched pre-prompt context with graph relationship explanations
     const filteredRulesText =
       rerankedRules.length > 4
         ? await compressRelevantEvidence(trimmed, rerankedRules)
@@ -1033,11 +1076,12 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       }));
     }
 
-    responsePayload.model_url        = null;
-    responsePayload.model_metadata   = null;
-    responsePayload.highlight_meshes = [];
-    responsePayload.context_meshes   = [];
-    responsePayload.cad_nodes        = [];
+    // 5. Connect the generated modelPayload to the response output
+    responsePayload.model_url        = modelPayload.model_url;
+    responsePayload.model_metadata   = modelPayload.model_metadata;
+    responsePayload.highlight_meshes = modelPayload.highlight_meshes;
+    responsePayload.context_meshes   = modelPayload.context_meshes;
+    responsePayload.cad_nodes        = modelPayload.cad_nodes;
 
     writeCache(expandedEmbedding, sanitizedDomain, explicitRuleIds, responsePayload);
     res.json(responsePayload);
@@ -1048,13 +1092,13 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       result:                  'success',
       domain:                  sanitizedDomain,
       intent,
-      model_found:             false,
-      model_name:              null,
+      model_found:             !!modelPayload.model_url,
+      model_name:              modelPayload.model_metadata?.name ?? null,
       citations_count:         rerankedRules.length,
       learned_citations_count: learnedMatches.length,
-      cad_nodes_count:         cadNodes.length,
-      highlight_meshes_count:  highlightMeshes.length,
-      context_meshes_count:    contextMeshes.length,
+      cad_nodes_count:         0,
+      highlight_meshes_count:  modelPayload.highlight_meshes.length,
+      context_meshes_count:    modelPayload.context_meshes.length,
       keyword_cad_hit:         false,
       cache_written:           true,
       created_at:              new Date().toISOString(),
@@ -1079,13 +1123,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     }
   }
 });
-
-// ── Feedback & learning ──────────────────────────────────────────────────────
-const RULE_ID_RE = /\b([A-Z]{1,3}\.?\d+(?:\.\d+){1,3})\b/;
-const URL_RE     = /\bhttps?:\/\/\S+/i;
-const CODE_RE    = /```|<code>|function\s*\(|class\s+\w+\s*[{:]/i;
-const ESC_RE     = /\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}/;
-
 function isValidLearnedPair(question: string, answer: string): { ok: boolean; reason?: string } {
   if (!RULE_ID_RE.test(answer)) {
     return { ok: false, reason: 'answer must reference a rule ID (e.g. [T.3.1.2])' };
